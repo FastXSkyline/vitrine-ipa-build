@@ -10,7 +10,7 @@ static NSString *SGRNormalizedMusicText(NSString *value) {
     NSArray<NSString *> *rawTokens = [folded componentsSeparatedByCharactersInSet:separators];
     NSSet<NSString *> *noise = [NSSet setWithArray:@[
         @"official", @"audio", @"video", @"lyrics", @"lyric", @"remastered", @"remaster",
-        @"visualizer", @"visualiser", @"topic", @"hd", @"uhd", @"music", @"full", @"version"
+        @"visualizer", @"visualiser", @"topic", @"hd", @"uhd", @"full", @"version"
     ]];
     NSMutableArray<NSString *> *tokens = [NSMutableArray array];
     for (NSString *token in rawTokens) {
@@ -51,7 +51,8 @@ static double SGRTitleSimilarity(NSString *requestedTitle, NSString *candidateTi
 }
 
 static BOOL SGRHasAllowedOpenLicense(NSDictionary *item) {
-    NSString *license = [[item[@"license"] isKindOfClass:NSString.class] ? item[@"license"] : @"" lowercaseString];
+    id licenseValue = item[@"license"];
+    NSString *license = [licenseValue isKindOfClass:NSString.class] ? [(NSString *)licenseValue lowercaseString] : @"";
     NSString *licenseURL = [item[@"license_url"] isKindOfClass:NSString.class] ? item[@"license_url"] : @"";
     NSURLComponents *components = [NSURLComponents componentsWithString:licenseURL];
     if (![components.scheme.lowercaseString isEqualToString:@"https"] ||
