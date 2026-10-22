@@ -547,7 +547,6 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
     _selectedResult = result;
     _downloadedFileURL = nil;
     _downloadedItemIdentifier = nil;
-    _downloadedDisplayName = nil;
     _downloadProgress = 0.0;
     _statusMessage = @"Starting download…";
     self.navigationItem.rightBarButtonItem.title = @"Cancel";
