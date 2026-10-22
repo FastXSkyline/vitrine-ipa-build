@@ -282,9 +282,9 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     double titleScore = [item[@"_vitrineTitleScore"] doubleValue];
     double artistScore = [item[@"_vitrineArtistScore"] doubleValue];
     NSNumber *durationDelta = item[@"_vitrineDurationDelta"];
-    // Any duration mismatch greater than 20 seconds is treated as another edit/version, not the same track.
-    if (durationDelta && durationDelta.doubleValue > 20.0) return NO;
-    return score >= 0.85 && titleScore >= 0.80 && artistScore >= 0.70;
+    // Only auto-download very strong matches. A similar title or artist isn't enough to claim it is the same recording.
+    if (durationDelta && durationDelta.doubleValue > 12.0) return NO;
+    return score >= 0.90 && titleScore >= 0.95 && artistScore >= 0.75;
 }
 
 - (void)performSearch {
@@ -711,6 +711,13 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         activity.popoverPresentationController.sourceRect = cell.bounds;
         [self presentViewController:activity animated:YES completion:nil];
     }]];
+    NSString *licenseURL = [entry[@"licenseURL"] isKindOfClass:NSString.class] ? entry[@"licenseURL"] : @"";
+    if (licenseURL.length) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"View licence" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSURL *url = [NSURL URLWithString:licenseURL];
+            if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
+        }]];
+    }
     [sheet addAction:[UIAlertAction actionWithTitle:@"Delete from Vitrine" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self deleteEntryAtIndex:indexPath.row];
     }]];
