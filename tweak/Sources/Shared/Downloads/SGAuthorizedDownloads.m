@@ -56,6 +56,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 @property (nonatomic) NSTimeInterval trackDuration;
 - (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration;
 - (NSDictionary *)normalizedAudiusTrack:(NSDictionary *)item;
+- (double)searchScoreForTrack:(NSDictionary *)track query:(NSString *)query;
 - (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items;
 - (BOOL)isConfidentMatch:(NSDictionary *)item;
 - (void)performSearchWithBroadFallback:(BOOL)broadFallback;
@@ -244,6 +245,19 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     return normalized;
 }
 
+- (double)searchScoreForTrack:(NSDictionary *)track query:(NSString *)query {
+    NSString *title = [track[@"name"] isKindOfClass:NSString.class] ? track[@"name"] : @"";
+    NSString *artist = [track[@"artist_name"] isKindOfClass:NSString.class] ? track[@"artist_name"] : @"";
+    NSString *album = [track[@"album_name"] isKindOfClass:NSString.class] ? track[@"album_name"] : @"";
+    NSString *candidate = [[@[title, artist, album] componentsJoinedByString:@" "]
+                           stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *normalizedQuery = SGDownloadNormalize(query);
+    NSString *normalizedCandidate = SGDownloadNormalize(candidate);
+    if (!normalizedQuery.length || !normalizedCandidate.length) return 0;
+    if ([normalizedCandidate containsString:normalizedQuery]) return 1.0;
+    return SGDownloadSimilarity(normalizedQuery, normalizedCandidate);
+}
+
 - (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items {
     NSDictionary *best = nil;
     double bestScore = -1;
@@ -390,12 +404,25 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
             }
 
             if (self->_manualSearch) {
-                // Show matching catalog entries even when the uploader has not enabled downloads.
-                if (catalogueResults.count > 8) {
-                    catalogueResults = [[catalogueResults subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                // The API sometimes returns loosely related results for short queries. Rank by
+                // the actual title/artist/album text and discard unrelated tracks before showing them.
+                NSString *manualQuery = [self->_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                [catalogueResults sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+                    double leftScore = [self searchScoreForTrack:left query:manualQuery];
+                    double rightScore = [self searchScoreForTrack:right query:manualQuery];
+                    if (leftScore > rightScore) return NSOrderedAscending;
+                    if (leftScore < rightScore) return NSOrderedDescending;
+                    return NSOrderedSame;
+                }];
+                NSMutableArray<NSDictionary *> *related = [NSMutableArray array];
+                for (NSDictionary *candidate in catalogueResults) {
+                    if ([self searchScoreForTrack:candidate query:manualQuery] >= 0.34) [related addObject:candidate];
                 }
-                self->_results = catalogueResults;
-                self->_searchMessage = catalogueResults.count ? nil : @"No tracks were found for that search on Audius.";
+                if (related.count > 8) {
+                    related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                }
+                self->_results = related;
+                self->_searchMessage = related.count ? nil : @"No relevant tracks were found for that title or artist on Audius.";
             } else {
                 NSDictionary *best = [self bestMatchFrom:permitted];
                 if ([self isConfidentMatch:best]) {
@@ -407,19 +434,24 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                     [self performSearchWithBroadFallback:YES];
                     return;
                 } else {
+                    NSString *currentQuery = [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
+                                               stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                    [catalogueResults sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+                        double leftScore = [self searchScoreForTrack:left query:currentQuery];
+                        double rightScore = [self searchScoreForTrack:right query:currentQuery];
+                        if (leftScore > rightScore) return NSOrderedAscending;
+                        if (leftScore < rightScore) return NSOrderedDescending;
+                        return NSOrderedSame;
+                    }];
                     NSMutableArray<NSDictionary *> *related = [NSMutableArray array];
                     for (NSDictionary *candidate in catalogueResults) {
-                        double titleSimilarity = SGDownloadSimilarity(self.trackTitle, candidate[@"name"]);
-                        double artistSimilarity = SGDownloadSimilarity(self.artistName, candidate[@"artist_name"]);
-                        if (titleSimilarity >= 0.34 || artistSimilarity >= 0.50) {
-                            [related addObject:candidate];
-                        }
+                        if ([self searchScoreForTrack:candidate query:currentQuery] >= 0.34) [related addObject:candidate];
                     }
                     if (related.count > 8) {
                         related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
                     }
                     self->_results = related;
-                    self->_searchMessage = related.count ? nil : @"No matching tracks were found in Audius's catalog.";
+                    self->_searchMessage = related.count ? nil : @"No relevant matches were found in Audius's catalog.";
                 }
             }
             [self.tableView reloadData];
