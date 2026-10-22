@@ -55,6 +55,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 @property (nonatomic, copy) NSString *artistName;
 @property (nonatomic) NSTimeInterval trackDuration;
 - (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration;
+- (NSDictionary *)normalizedAudiusTrack:(NSDictionary *)item;
 - (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items;
 - (BOOL)isConfidentMatch:(NSDictionary *)item;
 - (void)performSearchWithBroadFallback:(BOOL)broadFallback;
@@ -207,16 +208,18 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 }
 
 - (NSDictionary *)normalizedAudiusTrack:(NSDictionary *)item {
-    NSString *trackID = [item[@"id"] isKindOfClass:NSString.class] ? item[@"id"] : [item[@"id"] description];
-    NSString *title = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] : (item[@"name"] ?: @"");
+    id rawID = item[@"id"];
+    NSString *trackID = [rawID isKindOfClass:NSString.class] ? rawID :
+                        ([rawID respondsToSelector:@selector(stringValue)] ? [rawID stringValue] : @"");
+    NSString *title = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] :
+                      ([item[@"name"] isKindOfClass:NSString.class] ? item[@"name"] : @"");
     NSDictionary *user = [item[@"user"] isKindOfClass:NSDictionary.class] ? item[@"user"] : @{};
     NSString *artist = [user[@"name"] isKindOfClass:NSString.class] ? user[@"name"] :
                        ([user[@"handle"] isKindOfClass:NSString.class] ? user[@"handle"] :
                        ([item[@"artist_name"] isKindOfClass:NSString.class] ? item[@"artist_name"] : @""));
     if (!trackID.length || !title.length || !artist.length) return nil;
 
-    NSMutableCharacterSet *safeID = [NSMutableCharacterSet alphanumericCharacterSet];
-    [safeID addCharactersInString:@"-._~"];
+    NSMutableCharacterSet *safeID = [NSMutableCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"];
     NSString *encodedID = [trackID stringByAddingPercentEncodingWithAllowedCharacters:safeID];
     if (!encodedID.length) return nil;
 
