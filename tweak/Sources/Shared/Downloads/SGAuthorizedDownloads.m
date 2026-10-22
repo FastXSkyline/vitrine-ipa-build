@@ -316,13 +316,12 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
         [NSURLQueryItem queryItemWithName:@"format" value:@"json"],
         [NSURLQueryItem queryItemWithName:@"limit" value:@"50"],
         [NSURLQueryItem queryItemWithName:@"namesearch" value:query],
+        [NSURLQueryItem queryItemWithName:@"type" value:@"single albumtrack"],
         [NSURLQueryItem queryItemWithName:@"include" value:@"licenses"],
         [NSURLQueryItem queryItemWithName:@"order" value:@"relevance"]
     ] mutableCopy];
-    if (!_manualSearch && self.artistName.length) {
-        // Ask the catalogue for the artist as well, but still rank the returned candidates locally.
-        [queryItems addObject:[NSURLQueryItem queryItemWithName:@"artist_name" value:self.artistName]];
-    }
+    // Keep the server query focused on the title; artists and duration are ranked locally so
+    // punctuation or collaborative artist credits do not discard a valid candidate prematurely.
     if (!_manualSearch && self.trackDuration > 20) {
         NSInteger low = MAX(1, (NSInteger)floor(self.trackDuration - 20));
         NSInteger high = (NSInteger)ceil(self.trackDuration + 20);
@@ -425,9 +424,20 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     return NO;
 }
 
+- (NSString *)licenseURLForTrack:(NSDictionary *)track {
+    NSString *licenseURL = [track[@"license_ccurl"] isKindOfClass:NSString.class] ? track[@"license_ccurl"] : @"";
+    return licenseURL;
+}
+
 - (NSString *)licenseForTrack:(NSDictionary *)track {
-    NSString *license = [track[@"license_ccurl"] isKindOfClass:NSString.class] ? track[@"license_ccurl"] : @"";
-    return license.length ? license : @"Jamendo download permission enabled by artist";
+    NSString *url = [self licenseURLForTrack:track].lowercaseString;
+    if ([url containsString:@"/licenses/by-nc-sa/"]) return @"CC BY-NC-SA — attribution, non-commercial, share-alike";
+    if ([url containsString:@"/licenses/by-nc-nd/"]) return @"CC BY-NC-ND — attribution, non-commercial, no derivatives";
+    if ([url containsString:@"/licenses/by-nc/"]) return @"CC BY-NC — attribution, non-commercial";
+    if ([url containsString:@"/licenses/by-sa/"]) return @"CC BY-SA — attribution, share-alike";
+    if ([url containsString:@"/licenses/by-nd/"]) return @"CC BY-ND — attribution, no derivatives";
+    if ([url containsString:@"/licenses/by/"]) return @"CC BY — attribution";
+    return url.length ? @"Track licence — open licence details" : @"Jamendo download permission enabled by artist";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -647,7 +657,7 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
             @"artist": [track[@"artist_name"] isKindOfClass:NSString.class] ? track[@"artist_name"] : @"Unknown artist",
             @"album": [track[@"album_name"] isKindOfClass:NSString.class] ? track[@"album_name"] : @"",
             @"license": [self licenseForTrack:track],
-            @"licenseURL": [self licenseForTrack:track],
+            @"licenseURL": [self licenseURLForTrack:track],
             @"filename": _finishedPath.lastPathComponent,
             @"source": [track[@"shareurl"] isKindOfClass:NSString.class] ? track[@"shareurl"] : @"",
             @"added": @((long long)NSDate.date.timeIntervalSince1970)
