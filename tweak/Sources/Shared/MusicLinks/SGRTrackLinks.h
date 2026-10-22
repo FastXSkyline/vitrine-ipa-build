@@ -1,5 +1,4 @@
 #import <UIKit/UIKit.h>
 
-// Finds matched links and official search pages for the current track across music services.
-// Audio downloads remain controlled by each service's own rights and download options.
-void SGRTrackLinksPresent(UIView *source, NSString *trackTitle, NSString *artistName, NSString *trackURI);
+// Searches openly licensed audio, downloads a high-quality exact match, and preserves attribution.
+void SGRTrackLinksPresent(UIView *source, NSString *trackTitle, NSString *artistName, NSString *trackURI, NSTimeInterval duration);
