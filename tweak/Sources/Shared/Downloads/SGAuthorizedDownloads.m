@@ -102,10 +102,12 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     if (!_segments || !_searchBar) return;
     CGFloat width = CGRectGetWidth(self.tableView.bounds);
     UIView *header = self.tableView.tableHeaderView;
-    header.frame = CGRectMake(0, 0, width, 106);
+    CGRect newFrame = CGRectMake(0, 0, width, 106);
+    BOOL changed = !CGRectEqualToRect(header.frame, newFrame);
+    if (changed) header.frame = newFrame;
     _segments.frame = CGRectMake(16, 8, MAX(0, width - 32), 32);
     _searchBar.frame = CGRectMake(0, 42, width, 56);
-    self.tableView.tableHeaderView = header;
+    if (changed) self.tableView.tableHeaderView = header;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -117,6 +119,8 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 
 - (void)close {
     [_searchTask cancel];
+    [_activeTask cancel];
+    [_downloadSession invalidateAndCancel];
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
@@ -148,7 +152,6 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     [alert addAction:[UIAlertAction actionWithTitle:@"Get API ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSURL *url = [NSURL URLWithString:@"https://developer.jamendo.com/v3.0"];
         if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
-        if (searchAfterSave) dispatch_async(dispatch_get_main_queue(), ^{ [self promptForClientIDAndSearch:YES]; });
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *clientID = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
