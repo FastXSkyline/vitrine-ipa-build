@@ -13,6 +13,7 @@
 #import "Redesigned/ContextMenu/ContextMenu.h"
 #import "Shared/Player/PlayerState.h"
 #import "Shared/Player/SpeedPitch.h"
+#import "Shared/Downloads/SGAuthorizedDownloads.h"
 #import "Player.h"
 
 static __weak UIView *sg_moreButton;   // the ⋯ the sliders' panel comes from
@@ -53,6 +54,13 @@ static UIAction *soundMenu(void) {
 
 static NSArray<UIMenuElement *> *playerItems(void) {
     NSMutableArray<UIMenuElement *> *items = [NSMutableArray arrayWithObject:soundMenu()];
+    UIAction *downloads = [UIAction actionWithTitle:@"Vitrine Downloads" image:symbol(@"arrow.down.to.line") identifier:nil
+                                            handler:^(UIAction *action) {
+        SPTPlayerState *state = SGPlayerState();
+        SGRAuthorizedDownloadsPresent(sg_moreButton, state.track.trackTitle ?: @"", state.track.artistName ?: @"");
+    }];
+    downloads.subtitle = @"Search licensed music and save it to Vitrine";
+    [items addObject:downloads];
     if (SGPlayerMenuOffersAnimatedArtwork()) {
         // Buttons named for what they do, not checkmarks: the HIG's changeable label for a toggled item.
         NSArray<NSArray *> *backgrounds = @[
