@@ -236,7 +236,8 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     normalized[@"duration"] = item[@"duration"] ?: @0;
     normalized[@"album_name"] = @"";
     normalized[@"audiodownload"] = [NSString stringWithFormat:@"https://api.audius.co/v1/tracks/%@/download", encodedID];
-    normalized[@"audiodownload_allowed"] = @YES;
+    id canDownload = item[@"is_downloadable"] ?: item[@"isDownloadable"] ?: item[@"downloadable"];
+    normalized[@"audiodownload_allowed"] = @([canDownload respondsToSelector:@selector(boolValue)] && [canDownload boolValue]);
     normalized[@"_vitrineProvider"] = @"Audius";
     normalized[@"shareurl"] = permalink;
     normalized[@"license_ccurl"] = [item[@"license_url"] isKindOfClass:NSString.class] ? item[@"license_url"] : @"";
@@ -321,7 +322,6 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
         [NSURLQueryItem queryItemWithName:@"query" value:query],
         [NSURLQueryItem queryItemWithName:@"limit" value:@"50"],
         [NSURLQueryItem queryItemWithName:@"sort_method" value:@"relevant"],
-        [NSURLQueryItem queryItemWithName:@"only_downloadable" value:@"true"],
         [NSURLQueryItem queryItemWithName:@"app_name" value:@"Vitrine"]
     ] mutableCopy];
     // Duration remains a local ranking signal so alternate versions are not filtered out prematurely.
@@ -364,48 +364,51 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                 return;
             }
             NSArray *items = payload[@"data"];
+            NSMutableArray<NSDictionary *> *catalogueResults = [NSMutableArray array];
             NSMutableArray<NSDictionary *> *permitted = [NSMutableArray array];
             for (id candidate in items) {
                 if (![candidate isKindOfClass:NSDictionary.class]) continue;
                 NSDictionary *raw = candidate;
-                id canDownload = raw[@"downloadable"] ?: raw[@"is_downloadable"] ?: raw[@"isDownloadable"];
+                id canDownload = raw[@"is_downloadable"] ?: raw[@"isDownloadable"] ?: raw[@"downloadable"];
                 id streamGated = raw[@"is_stream_gated"] ?: raw[@"isStreamGated"] ?: @NO;
                 id downloadGated = raw[@"is_download_gated"] ?: raw[@"isDownloadGated"] ?: @NO;
                 id downloadConditions = raw[@"download_conditions"] ?: raw[@"downloadConditions"];
                 BOOL hasDownloadConditions = [downloadConditions isKindOfClass:NSDictionary.class] &&
                                              [(NSDictionary *)downloadConditions count] > 0;
-                // Only use the platform's own download endpoint when the uploader enabled downloads
-                // and the track is not gated behind a purchase/follow/token condition.
-                if (![canDownload respondsToSelector:@selector(boolValue)] || ![canDownload boolValue]) continue;
-                if ([streamGated respondsToSelector:@selector(boolValue)] && [streamGated boolValue]) continue;
-                if ([downloadGated respondsToSelector:@selector(boolValue)] && [downloadGated boolValue]) continue;
-                if (hasDownloadConditions) continue;
-                NSDictionary *normalized = [self normalizedAudiusTrack:raw];
-                if (normalized) [permitted addObject:normalized];
+                BOOL downloadEnabled = [canDownload respondsToSelector:@selector(boolValue)] && [canDownload boolValue];
+                BOOL streamIsGated = [streamGated respondsToSelector:@selector(boolValue)] && [streamGated boolValue];
+                BOOL downloadIsGated = [downloadGated respondsToSelector:@selector(boolValue)] && [downloadGated boolValue];
+                // Keep all search matches visible. Only tracks whose metadata explicitly enables download
+                // and does not indicate gated access may enter the download queue.
+                NSDictionary *normalizedRaw = [self normalizedAudiusTrack:raw];
+                if (!normalizedRaw) continue;
+                NSMutableDictionary *normalized = [normalizedRaw mutableCopy];
+                BOOL canActuallyDownload = downloadEnabled && !streamIsGated && !downloadIsGated && !hasDownloadConditions;
+                normalized[@"audiodownload_allowed"] = @(canActuallyDownload);
+                [catalogueResults addObject:normalized];
+                if (canActuallyDownload) [permitted addObject:normalized];
             }
 
             if (self->_manualSearch) {
-                // Manual fallback remains short; never display the entire catalogue response.
-                if (permitted.count > 8) permitted = [[permitted subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
-                self->_results = permitted;
-                self->_searchMessage = permitted.count ? nil : @"No downloadable Audius tracks were found for that search.";
+                // Show matching catalog entries even when the uploader has not enabled downloads.
+                if (catalogueResults.count > 8) {
+                    catalogueResults = [[catalogueResults subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                }
+                self->_results = catalogueResults;
+                self->_searchMessage = catalogueResults.count ? nil : @"No tracks were found for that search on Audius.";
             } else {
                 NSDictionary *best = [self bestMatchFrom:permitted];
                 if ([self isConfidentMatch:best]) {
                     self->_results = [NSMutableArray arrayWithObject:best];
                     self->_searchMessage = nil;
-                    // Only auto-download when title, artist and duration agree strongly.
                     [self enqueueTrack:best atFront:YES];
                 } else if (!broadFallback) {
-                    // The title-only endpoint can miss tracks when names or credits differ.
-                    // Retry once using the provider's broader title/artist search.
+                    // Retry once with title + artist instead of concluding there are no matches.
                     [self performSearchWithBroadFallback:YES];
                     return;
                 } else {
-                    // Show only plausible title/artist-related tracks as manual choices; do not
-                    // fill the screen with unrelated results from full-text/tag matching.
                     NSMutableArray<NSDictionary *> *related = [NSMutableArray array];
-                    for (NSDictionary *candidate in permitted) {
+                    for (NSDictionary *candidate in catalogueResults) {
                         double titleSimilarity = SGDownloadSimilarity(self.trackTitle, candidate[@"name"]);
                         double artistSimilarity = SGDownloadSimilarity(self.artistName, candidate[@"artist_name"]);
                         if (titleSimilarity >= 0.34 || artistSimilarity >= 0.50) {
@@ -416,7 +419,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                         related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
                     }
                     self->_results = related;
-                    self->_searchMessage = related.count ? nil : @"No downloadable match was found on Audius. Its catalog does not include every commercial release.";
+                    self->_searchMessage = related.count ? nil : @"No matching tracks were found in Audius's catalog.";
                 }
             }
             [self.tableView reloadData];
@@ -513,6 +516,12 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 
     NSString *state = _states[trackID];
     BOOL saved = [self isSavedTrackID:trackID];
+    if (![track[@"audiodownload_allowed"] boolValue]) {
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@\nNot downloadable on Audius — uploader has not enabled downloads or access is restricted.", artist];
+        cell.accessoryView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"lock.fill"]];
+        ((UIImageView *)cell.accessoryView).tintColor = UIColor.secondaryLabelColor;
+        return cell;
+    }
     if (saved) {
         cell.accessoryView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"checkmark.circle.fill"]];
         ((UIImageView *)cell.accessoryView).tintColor = UIColor.systemGreenColor;
@@ -553,6 +562,14 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     NSDictionary *track = _results[(NSUInteger)sender.tag];
     NSString *trackID = [track[@"id"] description];
     if ([self isSavedTrackID:trackID] || [_states[trackID] isEqualToString:@"Queued"] || [_states[trackID] isEqualToString:@"Downloading"]) return;
+    if (![track[@"audiodownload_allowed"] boolValue]) {
+        UIAlertController *unavailable = [UIAlertController alertControllerWithTitle:@"Download unavailable"
+                                                                             message:@"The uploader has not enabled downloads for this Audius track, or access is restricted. Vitrine cannot download this track from Audius."
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+        [unavailable addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:unavailable animated:YES completion:nil];
+        return;
+    }
 
     NSString *license = [self licenseForTrack:track];
     UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"Download track?"
