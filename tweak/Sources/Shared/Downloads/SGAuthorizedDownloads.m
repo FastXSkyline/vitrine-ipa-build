@@ -58,6 +58,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 - (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration;
 - (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items;
 - (BOOL)isConfidentMatch:(NSDictionary *)item;
+- (void)performSearchWithBroadFallback:(BOOL)broadFallback;
 @end
 
 @implementation SGAuthorizedDownloadsController {
@@ -132,7 +133,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                                                                                            target:self
                                                                                            action:@selector(close)];
     UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 66)];
-    footer.text = @"Vitrine matches the current track by title, artist and duration. Only files explicitly marked downloadable by their provider are saved; this library is separate from Spotify Downloads.";
+    footer.text = @"Vitrine searches Jamendo's downloadable music catalogue, then matches by title, artist and duration. Not every commercial Spotify release is in that catalogue. Saved files stay in Vitrine's separate library.";
     footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     footer.textColor = UIColor.secondaryLabelColor;
     footer.numberOfLines = 0;
@@ -288,6 +289,10 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 }
 
 - (void)performSearch {
+    [self performSearchWithBroadFallback:NO];
+}
+
+- (void)performSearchWithBroadFallback:(BOOL)broadFallback {
     if (_segments.selectedSegmentIndex != 0) _segments.selectedSegmentIndex = 0;
     NSString *clientID = [NSUserDefaults.standardUserDefaults stringForKey:kSGJamendoClientIDKey];
     if (!clientID.length) {
@@ -303,6 +308,12 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     if (!query.length && !_manualSearch) {
         query = [self.artistName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     }
+    // If title-only lookup is too narrow, retry against Jamendo's full-text search with
+    // both title and artist. This also handles searches pasted as "title artist".
+    if (!_manualSearch && broadFallback) {
+        query = [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
+                 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
     if (!query.length) {
         _searchMessage = @"No current track title is available.";
         [_results removeAllObjects];
@@ -315,19 +326,13 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
         [NSURLQueryItem queryItemWithName:@"client_id" value:clientID],
         [NSURLQueryItem queryItemWithName:@"format" value:@"json"],
         [NSURLQueryItem queryItemWithName:@"limit" value:@"50"],
-        [NSURLQueryItem queryItemWithName:@"namesearch" value:query],
+        [NSURLQueryItem queryItemWithName:((_manualSearch || broadFallback) ? @"search" : @"namesearch") value:query],
         [NSURLQueryItem queryItemWithName:@"type" value:@"single albumtrack"],
         [NSURLQueryItem queryItemWithName:@"include" value:@"licenses"],
         [NSURLQueryItem queryItemWithName:@"order" value:@"relevance"]
     ] mutableCopy];
-    // Keep the server query focused on the title; artists and duration are ranked locally so
-    // punctuation or collaborative artist credits do not discard a valid candidate prematurely.
-    if (!_manualSearch && self.trackDuration > 20) {
-        NSInteger low = MAX(1, (NSInteger)floor(self.trackDuration - 20));
-        NSInteger high = (NSInteger)ceil(self.trackDuration + 20);
-        [queryItems addObject:[NSURLQueryItem queryItemWithName:@"durationbetween"
-                                                          value:[NSString stringWithFormat:@"%ld_%ld", (long)low, (long)high]]];
-    }
+    // Do not pre-filter by duration on the server: alternate versions and remasters can differ.
+    // Duration still contributes to the local confidence score before any automatic download.
     components.queryItems = queryItems;
     NSURL *url = components.URL;
     if (!url) return;
@@ -386,18 +391,27 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                 // Manual fallback remains short; never display the entire catalogue response.
                 if (permitted.count > 8) permitted = [[permitted subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
                 self->_results = permitted;
-                self->_searchMessage = permitted.count ? nil : @"No downloadable tracks matched that title.";
+                self->_searchMessage = permitted.count ? nil : @"No downloadable tracks were found in Jamendo for that search. Only tracks whose creators allow downloads can be saved.";
             } else {
                 NSDictionary *best = [self bestMatchFrom:permitted];
                 if ([self isConfidentMatch:best]) {
                     self->_results = [NSMutableArray arrayWithObject:best];
                     self->_searchMessage = nil;
-                    // Choosing Download current track is the user's action; a high-confidence authorized
-                    // match is queued automatically with no second search or download button.
+                    // Only auto-download when title, artist and duration agree strongly.
                     [self enqueueTrack:best atFront:YES];
+                } else if (!broadFallback) {
+                    // The title-only endpoint can miss tracks when names or credits differ.
+                    // Retry once using the provider's broader title/artist search.
+                    [self performSearchWithBroadFallback:YES];
+                    return;
                 } else {
-                    self->_results = [NSMutableArray array];
-                    self->_searchMessage = @"No confident downloadable match was found for this exact title and artist. Use Search to check the licensed catalogue manually.";
+                    // Show permitted provider results as manual choices instead of hiding everything
+                    // just because a candidate did not pass the automatic-match threshold.
+                    if (permitted.count > 8) {
+                        permitted = [[permitted subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                    }
+                    self->_results = permitted;
+                    self->_searchMessage = permitted.count ? nil : @"No downloadable tracks were found in Jamendo for this title. Its catalogue does not include every commercial Spotify release.";
                 }
             }
             [self.tableView reloadData];
