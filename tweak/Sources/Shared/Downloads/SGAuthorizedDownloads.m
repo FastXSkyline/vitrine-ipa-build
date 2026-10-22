@@ -1,6 +1,7 @@
 // A separate, user-managed library for tracks from a provider that explicitly permits downloading.
 // This deliberately does not read Spotify stream URLs or write Spotify's private offline-download records.
 #import <AVFoundation/AVFoundation.h>
+#import <float.h>
 #import "Core/SGCore.h"
 #import "SGAuthorizedDownloads.h"
 
@@ -721,12 +722,12 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
 
 @end
 
-void SGRAuthorizedDownloadsPresent(UIView *source, NSString *trackTitle, NSString *artistName) {
+void SGRAuthorizedDownloadsPresent(UIView *source, NSString *trackTitle, NSString *artistName, NSTimeInterval duration) {
     UIWindow *window = source.window;
     UIViewController *presenter = window.rootViewController;
     if (!presenter) return;
     while (presenter.presentedViewController) presenter = presenter.presentedViewController;
-    SGAuthorizedDownloadsController *page = [[SGAuthorizedDownloadsController alloc] initWithTitle:trackTitle ?: @"" artist:artistName ?: @""];
+    SGAuthorizedDownloadsController *page = [[SGAuthorizedDownloadsController alloc] initWithTitle:trackTitle ?: @"" artist:artistName ?: @"" duration:duration];
     UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:page];
     navigation.modalPresentationStyle = UIModalPresentationPageSheet;
     if (@available(iOS 15.0, *)) {
