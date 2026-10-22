@@ -331,8 +331,13 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
         cell.accessoryView = bar;
     } else if ([state isEqualToString:@"Failed"]) {
         cell.detailTextLabel.text = [NSString stringWithFormat:@"Download failed · tap arrow to retry\n%@", [self licenseForTrack:track]];
-        cell.accessoryView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"exclamationmark.circle"]];
-        ((UIImageView *)cell.accessoryView).tintColor = UIColor.systemOrangeColor;
+        UIButton *retry = [UIButton buttonWithType:UIButtonTypeSystem];
+        retry.frame = CGRectMake(0, 0, 36, 36);
+        [retry setImage:[UIImage systemImageNamed:@"arrow.clockwise.circle"] forState:UIControlStateNormal];
+        retry.tintColor = UIColor.systemOrangeColor;
+        retry.tag = indexPath.row;
+        [retry addTarget:self action:@selector(downloadPressed:) forControlEvents:UIControlEventTouchUpInside];
+        cell.accessoryView = retry;
     } else {
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
         button.frame = CGRectMake(0, 0, 36, 36);
