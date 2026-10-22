@@ -10,6 +10,7 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 @interface SGAuthorizedDownloadsController : UITableViewController <UISearchBarDelegate, NSURLSessionDownloadDelegate>
 @property (nonatomic, copy) NSString *trackTitle;
 @property (nonatomic, copy) NSString *artistName;
+- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist;
 @end
 
 @implementation SGAuthorizedDownloadsController {
@@ -95,7 +96,6 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     [self layoutHeader];
-    SGInsetForBars(self.tableView);
 }
 
 - (void)layoutHeader {
