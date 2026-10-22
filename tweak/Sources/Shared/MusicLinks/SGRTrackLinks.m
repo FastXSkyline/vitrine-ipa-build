@@ -2,6 +2,7 @@
 // Only high-confidence title/artist/duration matches with an allowlisted license are downloaded.
 #import "Core/SGCore.h"
 #import "SGRTrackLinks.h"
+#import <math.h>
 
 static NSString *SGRNormalizedMusicText(NSString *value) {
     NSString *folded = [[(value ?: @"") stringByFoldingWithOptions:NSDiacriticInsensitiveSearch
@@ -45,6 +46,17 @@ static double SGRTitleSimilarity(NSString *requestedTitle, NSString *candidateTi
         NSArray<NSString *> *parts = [candidateTitle componentsSeparatedByString:separator];
         for (NSString *part in parts) {
             best = MAX(best, SGRTextSimilarityForStrings(requestedTitle, part));
+        }
+    }
+    return best;
+}
+
+static double SGRArtistSimilarity(NSString *requestedArtist, NSString *candidateCreator) {
+    double best = SGRTextSimilarityForStrings(requestedArtist, candidateCreator);
+    for (NSString *separator in @[@", ", @" & ", @" and ", @" feat. ", @" featuring ", @" ft. "]) {
+        NSArray<NSString *> *parts = [candidateCreator componentsSeparatedByString:separator];
+        for (NSString *part in parts) {
+            best = MAX(best, SGRTextSimilarityForStrings(requestedArtist, part));
         }
     }
     return best;
@@ -330,12 +342,16 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
             for (id candidate in results) {
                 if (![candidate isKindOfClass:NSDictionary.class]) continue;
                 NSDictionary *item = candidate;
+                NSString *provider = [item[@"provider"] isKindOfClass:NSString.class] ? [item[@"provider"] lowercaseString] : @"";
+                NSString *source = [item[@"source"] isKindOfClass:NSString.class] ? [item[@"source"] lowercaseString] : @"";
+                if ([provider containsString:@"jamendo"] || [source containsString:@"jamendo"] ||
+                    [provider containsString:@"audius"] || [source containsString:@"audius"]) continue;
                 if (!SGRHasAllowedOpenLicense(item)) continue;
 
                 NSString *candidateTitle = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] : @"";
                 NSString *candidateCreator = [item[@"creator"] isKindOfClass:NSString.class] ? item[@"creator"] : @"";
                 double titleScore = SGRTitleSimilarity(self->_trackTitle, candidateTitle);
-                double artistScore = SGRTextSimilarityForStrings(self->_artistName, candidateCreator);
+                double artistScore = SGRArtistSimilarity(self->_artistName, candidateCreator);
                 if (titleScore < 0.88 || artistScore < 0.72) continue;
 
                 double candidateDuration = [item[@"duration"] respondsToSelector:@selector(doubleValue)]
