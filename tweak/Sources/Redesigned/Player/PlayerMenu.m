@@ -54,12 +54,13 @@ static UIAction *soundMenu(void) {
 
 static NSArray<UIMenuElement *> *playerItems(void) {
     NSMutableArray<UIMenuElement *> *items = [NSMutableArray arrayWithObject:soundMenu()];
-    UIAction *downloads = [UIAction actionWithTitle:@"Vitrine Downloads" image:symbol(@"arrow.down.to.line") identifier:nil
+    UIAction *downloads = [UIAction actionWithTitle:@"Download current track" image:symbol(@"arrow.down.to.line") identifier:nil
                                             handler:^(UIAction *action) {
         SPTPlayerState *state = SGPlayerState();
-        SGRAuthorizedDownloadsPresent(sg_moreButton, state.track.trackTitle ?: @"", state.track.artistName ?: @"");
+        if (!state.track) return;
+        SGRAuthorizedDownloadsPresent(sg_moreButton, state.track.trackTitle ?: @"", state.track.artistName ?: @"", state.duration);
     }];
-    downloads.subtitle = @"Search licensed music and save it to Vitrine";
+    downloads.subtitle = @"Match title, artist and duration automatically";
     [items addObject:downloads];
     if (SGPlayerMenuOffersAnimatedArtwork()) {
         // Buttons named for what they do, not checkmarks: the HIG's changeable label for a toggled item.
