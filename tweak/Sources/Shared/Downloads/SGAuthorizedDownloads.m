@@ -5,7 +5,6 @@
 #import "Core/SGCore.h"
 #import "SGAuthorizedDownloads.h"
 
-static NSString *const kSGJamendoClientIDKey = @"spotifyglass.authorizedDownloads.jamendoClientID";
 static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownloads.library";
 
 static NSString *SGDownloadNormalize(NSString *value) {
@@ -109,7 +108,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 
     _searchBar = [UISearchBar new];
     _searchBar.delegate = self;
-    _searchBar.placeholder = @"Search licensed music";
+    _searchBar.placeholder = @"Search Audius tracks";
     NSString *query = [@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "];
     _searchBar.text = [query stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     _searchBar.hidden = YES;
@@ -124,16 +123,12 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                                                                      style:UIBarButtonItemStylePlain
                                                                     target:self
                                                                     action:@selector(enableManualSearch)];
-    UIBarButtonItem *apiButton = [[UIBarButtonItem alloc] initWithTitle:@"API ID"
-                                                                  style:UIBarButtonItemStylePlain
-                                                                 target:self
-                                                                 action:@selector(editClientID)];
-    self.navigationItem.rightBarButtonItems = @[searchButton, apiButton];
+    self.navigationItem.rightBarButtonItem = searchButton;
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
                                                                                            target:self
                                                                                            action:@selector(close)];
     UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 66)];
-    footer.text = @"Vitrine searches Jamendo's downloadable music catalogue, then matches by title, artist and duration. Not every commercial Spotify release is in that catalogue. Saved files stay in Vitrine's separate library.";
+    footer.text = @"Vitrine searches Audius for tracks whose creators enabled downloads, then matches by title, artist and duration. Not every commercial Spotify release is available. Saved files stay in Vitrine's separate library.";
     footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     footer.textColor = UIColor.secondaryLabelColor;
     footer.numberOfLines = 0;
@@ -206,41 +201,43 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     [_searchBar becomeFirstResponder];
 }
 
-- (void)editClientID {
-    [self promptForClientIDAndSearch:NO];
-}
-
-- (void)promptForClientIDAndSearch:(BOOL)searchAfterSave {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Jamendo API ID"
-                                                                   message:@"Search uses Jamendo's licensed music catalog. Add your own read-only API client ID from the Jamendo developer portal."
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"Client ID";
-        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        field.autocorrectionType = UITextAutocorrectionTypeNo;
-        field.text = [NSUserDefaults.standardUserDefaults stringForKey:kSGJamendoClientIDKey];
-        field.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Get API ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSURL *url = [NSURL URLWithString:@"https://developer.jamendo.com/v3.0"];
-        if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *clientID = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (clientID.length) {
-            [NSUserDefaults.standardUserDefaults setObject:clientID forKey:kSGJamendoClientIDKey];
-            if (searchAfterSave) [self performSearch];
-        } else if (searchAfterSave) {
-            [self promptForClientIDAndSearch:YES];
-        }
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
     [searchBar resignFirstResponder];
     [self performSearch];
+}
+
+- (NSDictionary *)normalizedAudiusTrack:(NSDictionary *)item {
+    NSString *trackID = [item[@"id"] isKindOfClass:NSString.class] ? item[@"id"] : [item[@"id"] description];
+    NSString *title = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] : (item[@"name"] ?: @"");
+    NSDictionary *user = [item[@"user"] isKindOfClass:NSDictionary.class] ? item[@"user"] : @{};
+    NSString *artist = [user[@"name"] isKindOfClass:NSString.class] ? user[@"name"] :
+                       ([user[@"handle"] isKindOfClass:NSString.class] ? user[@"handle"] :
+                       ([item[@"artist_name"] isKindOfClass:NSString.class] ? item[@"artist_name"] : @""));
+    if (!trackID.length || !title.length || !artist.length) return nil;
+
+    NSMutableCharacterSet *safeID = [NSMutableCharacterSet alphanumericCharacterSet];
+    [safeID addCharactersInString:@"-._~"];
+    NSString *encodedID = [trackID stringByAddingPercentEncodingWithAllowedCharacters:safeID];
+    if (!encodedID.length) return nil;
+
+    NSString *permalink = [item[@"permalink"] isKindOfClass:NSString.class] ? item[@"permalink"] : @"";
+    if (permalink.length && ![permalink.lowercaseString hasPrefix:@"http"]) {
+        while ([permalink hasPrefix:@"/"]) permalink = [permalink substringFromIndex:1];
+        permalink = [@"https://audius.co/" stringByAppendingString:permalink];
+    }
+
+    NSMutableDictionary *normalized = [item mutableCopy];
+    normalized[@"id"] = trackID;
+    normalized[@"name"] = title;
+    normalized[@"artist_name"] = artist;
+    normalized[@"duration"] = item[@"duration"] ?: @0;
+    normalized[@"album_name"] = @"";
+    normalized[@"audiodownload"] = [NSString stringWithFormat:@"https://api.audius.co/v1/tracks/%@/download", encodedID];
+    normalized[@"audiodownload_allowed"] = @YES;
+    normalized[@"_vitrineProvider"] = @"Audius";
+    normalized[@"shareurl"] = permalink;
+    normalized[@"license_ccurl"] = [item[@"license_url"] isKindOfClass:NSString.class] ? item[@"license_url"] : @"";
+    return normalized;
 }
 
 - (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items {
@@ -294,13 +291,9 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 
 - (void)performSearchWithBroadFallback:(BOOL)broadFallback {
     if (_segments.selectedSegmentIndex != 0) _segments.selectedSegmentIndex = 0;
-    NSString *clientID = [NSUserDefaults.standardUserDefaults stringForKey:kSGJamendoClientIDKey];
-    if (!clientID.length) {
-        [self promptForClientIDAndSearch:YES];
-        return;
-    }
 
-    // Automatic mode looks up the playing title only, then independently scores artist + duration.
+    // Audius has a read-only search endpoint; no client ID or manual API setup is required.
+    // Automatic mode starts with the playing title, then retries with title + artist.
     // Manual mode is an explicit fallback and uses what the user typed.
     NSString *query = _manualSearch
         ? [_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
@@ -308,8 +301,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     if (!query.length && !_manualSearch) {
         query = [self.artistName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     }
-    // If title-only lookup is too narrow, retry against Jamendo's full-text search with
-    // both title and artist. This also handles searches pasted as "title artist".
+    // If title-only lookup is too narrow, retry with both title and artist.
     if (!_manualSearch && broadFallback) {
         query = [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
                  stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -321,25 +313,22 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
         return;
     }
 
-    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://api.jamendo.com/v3.0/tracks/"];
+    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://api.audius.co/v1/tracks/search"];
     NSMutableArray<NSURLQueryItem *> *queryItems = [@[
-        [NSURLQueryItem queryItemWithName:@"client_id" value:clientID],
-        [NSURLQueryItem queryItemWithName:@"format" value:@"json"],
+        [NSURLQueryItem queryItemWithName:@"query" value:query],
         [NSURLQueryItem queryItemWithName:@"limit" value:@"50"],
-        [NSURLQueryItem queryItemWithName:((_manualSearch || broadFallback) ? @"search" : @"namesearch") value:query],
-        [NSURLQueryItem queryItemWithName:@"type" value:@"single albumtrack"],
-        [NSURLQueryItem queryItemWithName:@"include" value:@"licenses"],
-        [NSURLQueryItem queryItemWithName:@"order" value:@"relevance"]
+        [NSURLQueryItem queryItemWithName:@"sort_method" value:@"relevant"],
+        [NSURLQueryItem queryItemWithName:@"only_downloadable" value:@"true"],
+        [NSURLQueryItem queryItemWithName:@"app_name" value:@"Vitrine"]
     ] mutableCopy];
-    // Do not pre-filter by duration on the server: alternate versions and remasters can differ.
-    // Duration still contributes to the local confidence score before any automatic download.
+    // Duration remains a local ranking signal so alternate versions are not filtered out prematurely.
     components.queryItems = queryItems;
     NSURL *url = components.URL;
     if (!url) return;
 
     [_searchTask cancel];
     _searching = YES;
-    _searchMessage = _manualSearch ? @"Searching licensed tracks…" : @"Matching the current track…";
+    _searchMessage = _manualSearch ? @"Searching Audius for downloadable tracks…" : @"Matching the current track on Audius…";
     [_results removeAllObjects];
     [self.tableView reloadData];
 
@@ -351,7 +340,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
             self->_searching = NO;
             if (error) {
                 if (error.code == NSURLErrorCancelled) return;
-                self->_searchMessage = @"Lookup failed. Check the connection and Jamendo API ID, then try again.";
+                self->_searchMessage = @"Audius lookup failed. Check the connection and try again.";
                 [self.tableView reloadData];
                 return;
             }
@@ -363,35 +352,40 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
             }
             NSError *jsonError = nil;
             id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
-            if (![payload isKindOfClass:NSDictionary.class] || jsonError || ([payload[@"headers"] isKindOfClass:NSDictionary.class] && [payload[@"results"] isKindOfClass:NSArray.class] == NO)) {
-                self->_searchMessage = @"The music catalogue returned an unreadable response.";
+            if (![payload isKindOfClass:NSDictionary.class] || jsonError ||
+                ![payload[@"data"] isKindOfClass:NSArray.class]) {
+                NSString *detail = [payload isKindOfClass:NSDictionary.class] && [payload[@"error"] isKindOfClass:NSString.class]
+                    ? payload[@"error"] : @"The Audius API returned an unreadable response.";
+                self->_searchMessage = detail;
                 [self.tableView reloadData];
                 return;
             }
-            if ([payload[@"headers"] isKindOfClass:NSDictionary.class] && [payload[@"headers"][@"status"] isKindOfClass:NSString.class]
-                && [payload[@"headers"][@"status"] caseInsensitiveCompare:@"success"] != NSOrderedSame) {
-                self->_searchMessage = @"The music catalogue rejected this request. Check the API ID.";
-                [self.tableView reloadData];
-                return;
-            }
-            NSArray *items = [payload[@"results"] isKindOfClass:NSArray.class] ? payload[@"results"] : @[];
+            NSArray *items = payload[@"data"];
             NSMutableArray<NSDictionary *> *permitted = [NSMutableArray array];
             for (id candidate in items) {
                 if (![candidate isKindOfClass:NSDictionary.class]) continue;
-                NSDictionary *item = candidate;
-                NSString *downloadURL = [item[@"audiodownload"] isKindOfClass:NSString.class] ? item[@"audiodownload"] : @"";
-                id canDownload = item[@"audiodownload_allowed"];
-                // Fail closed: the provider must explicitly allow this file to be downloaded.
-                if (![canDownload respondsToSelector:@selector(boolValue)] || ![canDownload boolValue] || !downloadURL.length) continue;
-                if (![item[@"id"] isKindOfClass:NSString.class] || ![item[@"name"] isKindOfClass:NSString.class]) continue;
-                [permitted addObject:item];
+                NSDictionary *raw = candidate;
+                id canDownload = raw[@"downloadable"] ?: raw[@"is_downloadable"] ?: raw[@"isDownloadable"];
+                id streamGated = raw[@"is_stream_gated"] ?: raw[@"isStreamGated"] ?: @NO;
+                id downloadGated = raw[@"is_download_gated"] ?: raw[@"isDownloadGated"] ?: @NO;
+                id downloadConditions = raw[@"download_conditions"] ?: raw[@"downloadConditions"];
+                BOOL hasDownloadConditions = [downloadConditions isKindOfClass:NSDictionary.class] &&
+                                             [(NSDictionary *)downloadConditions count] > 0;
+                // Only use the platform's own download endpoint when the uploader enabled downloads
+                // and the track is not gated behind a purchase/follow/token condition.
+                if (![canDownload respondsToSelector:@selector(boolValue)] || ![canDownload boolValue]) continue;
+                if ([streamGated respondsToSelector:@selector(boolValue)] && [streamGated boolValue]) continue;
+                if ([downloadGated respondsToSelector:@selector(boolValue)] && [downloadGated boolValue]) continue;
+                if (hasDownloadConditions) continue;
+                NSDictionary *normalized = [self normalizedAudiusTrack:raw];
+                if (normalized) [permitted addObject:normalized];
             }
 
             if (self->_manualSearch) {
                 // Manual fallback remains short; never display the entire catalogue response.
                 if (permitted.count > 8) permitted = [[permitted subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
                 self->_results = permitted;
-                self->_searchMessage = permitted.count ? nil : @"No downloadable tracks were found in Jamendo for that search. Only tracks whose creators allow downloads can be saved.";
+                self->_searchMessage = permitted.count ? nil : @"No downloadable Audius tracks were found for that search.";
             } else {
                 NSDictionary *best = [self bestMatchFrom:permitted];
                 if ([self isConfidentMatch:best]) {
@@ -419,7 +413,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                         related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
                     }
                     self->_results = related;
-                    self->_searchMessage = related.count ? nil : @"No downloadable match was found in Jamendo. Its catalogue does not include every commercial Spotify release.";
+                    self->_searchMessage = related.count ? nil : @"No downloadable match was found on Audius. Its catalog does not include every commercial release.";
                 }
             }
             [self.tableView reloadData];
@@ -448,6 +442,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 
 - (NSString *)licenseURLForTrack:(NSDictionary *)track {
     NSString *licenseURL = [track[@"license_ccurl"] isKindOfClass:NSString.class] ? track[@"license_ccurl"] : @"";
+    if (!licenseURL.length && [track[@"license_url"] isKindOfClass:NSString.class]) licenseURL = track[@"license_url"];
     return licenseURL;
 }
 
@@ -459,7 +454,10 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     if ([url containsString:@"/licenses/by-sa/"]) return @"CC BY-SA — attribution, share-alike";
     if ([url containsString:@"/licenses/by-nd/"]) return @"CC BY-ND — attribution, no derivatives";
     if ([url containsString:@"/licenses/by/"]) return @"CC BY — attribution";
-    return url.length ? @"Track licence — open licence details" : @"Jamendo download permission enabled by artist";
+    if ([track[@"_vitrineProvider"] isEqualToString:@"Audius"]) {
+        return url.length ? @"Creator-enabled Audius download — review license" : @"Audius uploader enabled downloads — review the uploader's terms";
+    }
+    return url.length ? @"Track licence — open licence details" : @"Provider-enabled download";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -483,7 +481,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     if (libraryMode) {
         if (_library.count == 0) {
             cell.textLabel.text = @"Your Vitrine library is empty";
-            cell.detailTextLabel.text = @"Search licensed music, then tap the download icon to save a permitted file here.";
+            cell.detailTextLabel.text = @"Search Audius for creator-enabled downloads, then save a track to this library.";
             cell.textLabel.textColor = UIColor.secondaryLabelColor;
             return cell;
         }
@@ -554,8 +552,8 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     if ([self isSavedTrackID:trackID] || [_states[trackID] isEqualToString:@"Queued"] || [_states[trackID] isEqualToString:@"Downloading"]) return;
 
     NSString *license = [self licenseForTrack:track];
-    UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"Download licensed track?"
-                                                                          message:[NSString stringWithFormat:@"%@ — %@\n\nThe provider reports that downloading is allowed. Review the track's license before reusing or redistributing it.\n\n%@", track[@"name"] ?: @"Track", track[@"artist_name"] ?: @"Unknown artist", license]
+    UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"Download track?"
+                                                                          message:[NSString stringWithFormat:@"%@ — %@\n\nAudius reports that the uploader enabled downloads. Check the uploader's terms before reusing or redistributing the file.\n\n%@", track[@"name"] ?: @"Track", track[@"artist_name"] ?: @"Unknown artist", license]
                                                                    preferredStyle:UIAlertControllerStyleAlert];
     [confirmation addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [confirmation addAction:[UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
@@ -576,10 +574,11 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     [self startNextDownload];
 }
 
-- (BOOL)isAllowedJamendoDownloadURL:(NSURL *)url {
+- (BOOL)isAllowedAudiusDownloadURL:(NSURL *)url {
     NSString *scheme = url.scheme.lowercaseString;
     NSString *host = url.host.lowercaseString;
-    BOOL validHost = [host isEqualToString:@"jamendo.com"] || [host hasSuffix:@".jamendo.com"];
+    BOOL validHost = [host isEqualToString:@"api.audius.co"] ||
+                     [host isEqualToString:@"discoveryprovider.audius.co"];
     return [scheme isEqualToString:@"https"] && validHost;
 }
 
@@ -589,7 +588,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
     [_queue removeObjectAtIndex:0];
     NSURL *url = [NSURL URLWithString:track[@"audiodownload"] ?: @""];
     NSString *trackID = [track[@"id"] description];
-    if (![self isAllowedJamendoDownloadURL:url]) {
+    if (![self isAllowedAudiusDownloadURL:url]) {
         _states[trackID] = @"Failed";
         [self.tableView reloadData];
         [self startNextDownload];
