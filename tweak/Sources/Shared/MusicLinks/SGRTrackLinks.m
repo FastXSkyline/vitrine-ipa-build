@@ -97,12 +97,17 @@ static NSString *SGRPlatformName(NSString *key) {
 - (void)layoutSearchHeader {
     UIView *header = self.tableView.tableHeaderView;
     if (!header) return;
-    CGFloat width = CGRectGetWidth(self.tableView.bounds);
+    CGFloat width = MAX(0, CGRectGetWidth(self.tableView.bounds));
     CGFloat height = _searchMode ? 56.0 : 0.0;
-    header.frame = CGRectMake(0, 0, width, height);
+    CGRect targetFrame = CGRectMake(0, 0, width, height);
+    BOOL sizeChanged = !CGSizeEqualToSize(header.frame.size, targetFrame.size);
+    if (!CGRectEqualToRect(header.frame, targetFrame)) header.frame = targetFrame;
     _searchBar.frame = CGRectMake(0, 0, width, 56);
     _searchBar.hidden = !_searchMode;
-    self.tableView.tableHeaderView = header;
+
+    // Reassigning tableHeaderView from every layout pass can repeatedly invalidate the table.
+    // Only reassign it when its size changed (for example when Search is toggled or on rotation).
+    if (sizeChanged) self.tableView.tableHeaderView = header;
 }
 
 - (void)toggleSearch {
@@ -316,19 +321,38 @@ static NSString *SGRPlatformName(NSString *key) {
 @end
 
 void SGRTrackLinksPresent(UIView *source, NSString *trackTitle, NSString *artistName, NSString *trackURI) {
-    UIWindow *window = source.window;
-    UIViewController *presenter = window.rootViewController;
-    if (!presenter) return;
-    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
-    SGRTrackLinksController *page = [[SGRTrackLinksController alloc] initWithTitle:trackTitle ?: @""
-                                                                           artist:artistName ?: @""
-                                                                          trackURI:trackURI ?: @""];
-    UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:page];
-    navigation.modalPresentationStyle = UIModalPresentationPageSheet;
-    if (@available(iOS 15.0, *)) {
-        navigation.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.largeDetent];
-        navigation.sheetPresentationController.prefersGrabberVisible = YES;
-    }
-    SGPresentDark(navigation);
-    [presenter presentViewController:navigation animated:YES completion:nil];
+    // A UIMenu action is still being dismissed when its handler runs. Presenting a sheet inline
+    // can leave UIKit's menu/presentation transition stuck, so wait until the action has returned.
+    __weak UIView *weakSource = source;
+    NSString *title = [trackTitle copy] ?: @"";
+    NSString *artist = [artistName copy] ?: @"";
+    NSString *uri = [trackURI copy] ?: @"";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *anchor = weakSource;
+        UIWindow *window = anchor.window;
+        UIViewController *presenter = window.rootViewController;
+        if (!window || !presenter || presenter.isBeingDismissed) return;
+
+        // Follow the active presentation chain, but guard against an unexpected controller cycle.
+        NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+        while (presenter.presentedViewController) {
+            NSValue *identity = [NSValue valueWithNonretainedObject:presenter];
+            if ([visited containsObject:identity]) break;
+            [visited addObject:identity];
+            presenter = presenter.presentedViewController;
+        }
+        if (presenter.isBeingDismissed || presenter.isBeingPresented) return;
+
+        SGRTrackLinksController *page = [[SGRTrackLinksController alloc] initWithTitle:title
+                                                                               artist:artist
+                                                                              trackURI:uri];
+        UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:page];
+        navigation.modalPresentationStyle = UIModalPresentationPageSheet;
+        if (@available(iOS 15.0, *)) {
+            navigation.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.largeDetent];
+            navigation.sheetPresentationController.prefersGrabberVisible = YES;
+        }
+        SGPresentDark(navigation);
+        [presenter presentViewController:navigation animated:YES completion:nil];
+    });
 }
