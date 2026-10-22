@@ -28,6 +28,7 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     NSString *_finishedPath;
     NSString *_downloadFailureReason;
     BOOL _attemptedInitialSearch;
+    BOOL _closing;
     BOOL _searching;
     NSString *_searchMessage;
 }
@@ -119,9 +120,17 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 
 - (void)close {
     [_searchTask cancel];
-    [_activeTask cancel];
-    [_downloadSession invalidateAndCancel];
+    _closing = YES;
+    if (!_activeTask && !_queue.count) [_downloadSession finishTasksAndInvalidate];
     [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (self.isBeingDismissed || self.navigationController.isBeingDismissed) {
+        _closing = YES;
+        if (!_activeTask && !_queue.count) [_downloadSession finishTasksAndInvalidate];
+    }
 }
 
 - (void)segmentChanged:(UISegmentedControl *)sender {
@@ -266,7 +275,7 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (_segments.selectedSegmentIndex == 1) return (NSInteger)_library.count;
+    if (_segments.selectedSegmentIndex == 1) return MAX(1, (NSInteger)_library.count);
     if (_searching && !_results.count) return 1;
     if (!_results.count) return 1;
     return (NSInteger)_results.count;
@@ -507,6 +516,7 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     _downloadFailureReason = nil;
     [self.tableView reloadData];
     [self startNextDownload];
+    if (_closing && !_activeTask && !_queue.count) [_downloadSession finishTasksAndInvalidate];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
