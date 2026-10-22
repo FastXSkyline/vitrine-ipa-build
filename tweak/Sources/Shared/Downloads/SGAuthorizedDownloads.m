@@ -1,823 +1,328 @@
-// A separate, user-managed library for tracks from a provider that explicitly permits downloading.
-// This deliberately does not read Spotify stream URLs or write Spotify's private offline-download records.
-#import <AVFoundation/AVFoundation.h>
-#import <float.h>
+// Cross-platform song link resolver. This deliberately opens official music-service pages
+// rather than copying protected streams or writing Spotify's private offline-download records.
 #import "Core/SGCore.h"
 #import "SGAuthorizedDownloads.h"
 
-static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownloads.library";
-
-static NSString *SGDownloadNormalize(NSString *value) {
-    if (![value isKindOfClass:NSString.class]) return @"";
-    NSString *folded = [[value lowercaseString] stringByFoldingWithOptions:NSDiacriticInsensitiveSearch
-                                                                      locale:[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]];
-    NSCharacterSet *lettersAndDigits = NSCharacterSet.alphanumericCharacterSet;
-    NSMutableString *normalized = [NSMutableString string];
-    BOOL needsSpace = NO;
-    for (NSUInteger i = 0; i < folded.length; i++) {
-        unichar character = [folded characterAtIndex:i];
-        if ([lettersAndDigits characterIsMember:character]) {
-            if (needsSpace && normalized.length) [normalized appendString:@" "];
-            [normalized appendFormat:@"%C", character];
-            needsSpace = NO;
-        } else {
-            needsSpace = YES;
-        }
-    }
-    return [normalized stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+static NSString *SGRPlatformName(NSString *key) {
+    NSDictionary<NSString *, NSString *> *names = @{
+        @"spotify": @"Spotify",
+        @"appleMusic": @"Apple Music",
+        @"itunes": @"iTunes Store",
+        @"youtubeMusic": @"YouTube Music",
+        @"youtube": @"YouTube",
+        @"soundcloud": @"SoundCloud",
+        @"deezer": @"Deezer",
+        @"tidal": @"TIDAL",
+        @"amazonMusic": @"Amazon Music",
+        @"pandora": @"Pandora",
+        @"napster": @"Napster",
+        @"yandex": @"Yandex Music",
+        @"anghami": @"Anghami",
+        @"audius": @"Audius",
+        @"qobuz": @"Qobuz"
+    };
+    return names[key] ?: key;
 }
 
-static NSSet<NSString *> *SGDownloadTokens(NSString *value) {
-    NSString *normalized = SGDownloadNormalize(value);
-    if (!normalized.length) return [NSSet set];
-    NSMutableSet<NSString *> *tokens = [NSMutableSet setWithArray:[normalized componentsSeparatedByString:@" "]];
-    [tokens removeObject:@"feat"];
-    [tokens removeObject:@"featuring"];
-    [tokens removeObject:@"with"];
-    return tokens;
-}
-
-// Conservative token overlap: a partial phrase is not treated as an exact song/artist match.
-static double SGDownloadSimilarity(NSString *left, NSString *right) {
-    NSString *a = SGDownloadNormalize(left), *b = SGDownloadNormalize(right);
-    if (!a.length || !b.length) return 0;
-    if ([a isEqualToString:b]) return 1.0;
-    NSSet<NSString *> *leftTokens = SGDownloadTokens(a);
-    NSSet<NSString *> *rightTokens = SGDownloadTokens(b);
-    if (!leftTokens.count || !rightTokens.count) return 0;
-    NSMutableSet<NSString *> *common = [leftTokens mutableCopy];
-    [common intersectSet:rightTokens];
-    return (double)common.count / (double)MAX(leftTokens.count, rightTokens.count);
-}
-
-@interface SGAuthorizedDownloadsController : UITableViewController <UISearchBarDelegate, NSURLSessionDownloadDelegate>
+@interface SGRTrackLinksController : UITableViewController <UISearchBarDelegate>
 @property (nonatomic, copy) NSString *trackTitle;
 @property (nonatomic, copy) NSString *artistName;
-@property (nonatomic) NSTimeInterval trackDuration;
-- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration;
-- (NSDictionary *)normalizedAudiusTrack:(NSDictionary *)item;
-- (double)searchScoreForTrack:(NSDictionary *)track query:(NSString *)query;
-- (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items;
-- (BOOL)isConfidentMatch:(NSDictionary *)item;
-- (void)performSearchWithBroadFallback:(BOOL)broadFallback;
+@property (nonatomic, copy) NSString *trackURI;
+- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist trackURI:(NSString *)trackURI;
 @end
 
-@implementation SGAuthorizedDownloadsController {
+@implementation SGRTrackLinksController {
     UISearchBar *_searchBar;
-    UISegmentedControl *_segments;
-    NSMutableArray<NSDictionary *> *_results;
-    NSMutableArray<NSDictionary *> *_library;
-    NSMutableArray<NSDictionary *> *_queue;
-    NSMutableDictionary<NSString *, NSString *> *_states;
-    NSMutableDictionary<NSString *, NSNumber *> *_progress;
-    NSURLSession *_downloadSession;
-    NSURLSessionDataTask *_searchTask;
-    NSURLSessionDownloadTask *_activeTask;
-    NSDictionary *_activeTrack;
-    NSString *_finishedPath;
-    NSString *_downloadFailureReason;
-    BOOL _attemptedInitialSearch;
-    BOOL _closing;
-    BOOL _manualSearch;
-    BOOL _searching;
-    NSString *_searchMessage;
+    NSMutableArray<NSDictionary *> *_items;
+    NSURLSessionDataTask *_task;
+    BOOL _searchMode;
+    BOOL _loading;
+    BOOL _started;
+    NSString *_statusMessage;
 }
 
-- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration {
+- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist trackURI:(NSString *)trackURI {
     if (!(self = [super initWithStyle:UITableViewStyleInsetGrouped])) return nil;
     self.trackTitle = [title copy] ?: @"";
     self.artistName = [artist copy] ?: @"";
-    self.trackDuration = MAX(0, duration);
-    _results = [NSMutableArray array];
-    _library = [[NSUserDefaults.standardUserDefaults arrayForKey:kSGAuthorizedLibraryKey] mutableCopy] ?: [NSMutableArray array];
-    _queue = [NSMutableArray array];
-    _states = [NSMutableDictionary dictionary];
-    _progress = [NSMutableDictionary dictionary];
+    self.trackURI = [trackURI copy] ?: @"";
+    _items = [NSMutableArray array];
     return self;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Vitrine Downloads";
+    self.title = @"Find Across Platforms";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 72;
-
-    _segments = [[UISegmentedControl alloc] initWithItems:@[@"Current track", @"Library"]];
-    _segments.selectedSegmentIndex = 0;
-    [_segments addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
+    self.tableView.estimatedRowHeight = 68;
 
     _searchBar = [UISearchBar new];
     _searchBar.delegate = self;
-    _searchBar.placeholder = @"Search Audius tracks";
-    NSString *query = [@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "];
-    _searchBar.text = [query stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    _searchBar.placeholder = @"Search title or artist";
+    _searchBar.text = [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
+                       stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     _searchBar.hidden = YES;
 
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, CGRectGetWidth(self.tableView.bounds), 50)];
-    [header addSubview:_segments];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, CGRectGetWidth(self.tableView.bounds), 0)];
     [header addSubview:_searchBar];
     self.tableView.tableHeaderView = header;
-    [self layoutHeader];
+    [self layoutSearchHeader];
 
-    UIBarButtonItem *searchButton = [[UIBarButtonItem alloc] initWithTitle:@"Search"
-                                                                     style:UIBarButtonItemStylePlain
-                                                                    target:self
-                                                                    action:@selector(enableManualSearch)];
-    self.navigationItem.rightBarButtonItem = searchButton;
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Search"
+                                                                                style:UIBarButtonItemStylePlain
+                                                                               target:self
+                                                                               action:@selector(toggleSearch)];
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
                                                                                            target:self
                                                                                            action:@selector(close)];
-    UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 66)];
-    footer.text = @"Vitrine searches Audius for tracks whose creators enabled downloads, then matches by title, artist and duration. Not every commercial Spotify release is available. Saved files stay in Vitrine's separate library.";
+
+    UILabel *footer = [[UILabel alloc] initWithFrame:CGRectZero];
+    footer.text = @"Exact matches open the service's official song page. Search links are included for platforms that did not return an exact match. Full-track downloads are available only through each service's own download or purchase options.";
     footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     footer.textColor = UIColor.secondaryLabelColor;
     footer.numberOfLines = 0;
     footer.textAlignment = NSTextAlignmentCenter;
-    footer.frame = CGRectMake(0, 0, CGRectGetWidth(self.tableView.bounds) - 40, 66);
+    footer.frame = CGRectMake(0, 0, MAX(0, CGRectGetWidth(self.tableView.bounds) - 40), 96);
     footer.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     self.tableView.tableFooterView = footer;
-
-    NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
-    configuration.timeoutIntervalForRequest = 25;
-    configuration.timeoutIntervalForResource = 180;
-    _downloadSession = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:NSOperationQueue.mainQueue];
-
-    [self ensureDownloadsDirectory];
 }
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    [self layoutHeader];
+    [self layoutSearchHeader];
 }
 
-- (void)layoutHeader {
-    if (!_segments || !_searchBar) return;
-    CGFloat width = CGRectGetWidth(self.tableView.bounds);
-    BOOL showSearch = _manualSearch && _segments.selectedSegmentIndex == 0;
-    _searchBar.hidden = !showSearch;
+- (void)layoutSearchHeader {
     UIView *header = self.tableView.tableHeaderView;
-    CGFloat height = showSearch ? 106 : 50;
-    CGRect newFrame = CGRectMake(0, 0, width, height);
-    BOOL changed = !CGRectEqualToRect(header.frame, newFrame);
-    if (changed) header.frame = newFrame;
-    _segments.frame = CGRectMake(16, 8, MAX(0, width - 32), 32);
-    _searchBar.frame = CGRectMake(0, 42, width, 56);
-    if (changed) self.tableView.tableHeaderView = header;
+    if (!header) return;
+    CGFloat width = CGRectGetWidth(self.tableView.bounds);
+    CGFloat height = _searchMode ? 56.0 : 0.0;
+    header.frame = CGRectMake(0, 0, width, height);
+    _searchBar.frame = CGRectMake(0, 0, width, 56);
+    _searchBar.hidden = !_searchMode;
+    self.tableView.tableHeaderView = header;
+}
+
+- (void)toggleSearch {
+    _searchMode = !_searchMode;
+    [self layoutSearchHeader];
+    if (_searchMode) {
+        [_searchBar becomeFirstResponder];
+    } else {
+        [_searchBar resignFirstResponder];
+    }
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    if (_attemptedInitialSearch) return;
-    _attemptedInitialSearch = YES;
-    if (_searchBar.text.length) [self performSearch];
+    if (_started) return;
+    _started = YES;
+    [self resolveCurrentTrack];
 }
 
 - (void)close {
-    [_searchTask cancel];
-    _closing = YES;
-    if (!_activeTask && !_queue.count) [_downloadSession finishTasksAndInvalidate];
+    [_task cancel];
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
-- (void)viewDidDisappear:(BOOL)animated {
-    [super viewDidDisappear:animated];
-    if (self.isBeingDismissed || self.navigationController.isBeingDismissed) {
-        _closing = YES;
-        if (!_activeTask && !_queue.count) [_downloadSession finishTasksAndInvalidate];
+- (NSString *)spotifyURLFromTrackURI {
+    NSString *value = [self.trackURI stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([value.lowercaseString hasPrefix:@"https://open.spotify.com/track/"]) return value;
+    NSArray<NSString *> *parts = [value componentsSeparatedByString:@":"];
+    if (parts.count >= 3 && [parts[0] isEqualToString:@"spotify"] && [parts[1] isEqualToString:@"track"] && parts[2].length) {
+        NSString *trackID = parts[2];
+        NSCharacterSet *safe = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+        if ([trackID rangeOfCharacterFromSet:[safe invertedSet]].location != NSNotFound) return nil;
+        return [NSString stringWithFormat:@"https://open.spotify.com/track/%@", trackID];
     }
+    return nil;
 }
 
-- (void)segmentChanged:(UISegmentedControl *)sender {
-    if (sender.selectedSegmentIndex == 1) [_searchBar resignFirstResponder];
-    [self layoutHeader];
+- (NSString *)currentSearchQuery {
+    return [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+- (NSArray<NSDictionary *> *)platformSearchItemsForQuery:(NSString *)query excludingKeys:(NSSet<NSString *> *)excludedKeys {
+    NSArray<NSDictionary *> *platforms = @[
+        @{@"key": @"spotify", @"name": @"Spotify", @"base": @"https://open.spotify.com/search", @"parameter": @"q"},
+        @{@"key": @"appleMusic", @"name": @"Apple Music", @"base": @"https://music.apple.com/us/search", @"parameter": @"term"},
+        @{@"key": @"youtubeMusic", @"name": @"YouTube Music", @"base": @"https://music.youtube.com/search", @"parameter": @"q"},
+        @{@"key": @"youtube", @"name": @"YouTube", @"base": @"https://www.youtube.com/results", @"parameter": @"search_query"},
+        @{@"key": @"soundcloud", @"name": @"SoundCloud", @"base": @"https://soundcloud.com/search/sounds", @"parameter": @"q"},
+        @{@"key": @"deezer", @"name": @"Deezer", @"base": @"https://www.deezer.com/search", @"parameter": @"q"},
+        @{@"key": @"tidal", @"name": @"TIDAL", @"base": @"https://listen.tidal.com/search", @"parameter": @"q"},
+        @{@"key": @"amazonMusic", @"name": @"Amazon Music", @"base": @"https://music.amazon.com/search", @"parameter": @"k"}
+    ];
+    NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
+    for (NSDictionary *platform in platforms) {
+        NSString *key = platform[@"key"];
+        if ([excludedKeys containsObject:key]) continue;
+        NSURLComponents *components = [NSURLComponents componentsWithString:platform[@"base"]];
+        components.queryItems = @[[NSURLQueryItem queryItemWithName:platform[@"parameter"] value:query]];
+        NSString *url = components.URL.absoluteString;
+        if (!url.length) continue;
+        [items addObject:@{
+            @"platformKey": key,
+            @"platform": platform[@"name"],
+            @"url": url,
+            @"detail": @"Search this service",
+            @"isSearch": @YES
+        }];
+    }
+    return items;
+}
+
+- (void)showFallbackSearchesWithMessage:(NSString *)message {
+    [_items removeAllObjects];
+    NSString *query = [self currentSearchQuery];
+    if (!query.length) query = self.trackTitle ?: self.artistName ?: @"";
+    NSArray<NSDictionary *> *searches = [self platformSearchItemsForQuery:query excludingKeys:[NSSet set]];
+    [_items addObjectsFromArray:searches];
+    _loading = NO;
+    _statusMessage = message;
     [self.tableView reloadData];
 }
 
-- (void)enableManualSearch {
-    _manualSearch = YES;
-    if (_searchBar.text.length == 0) _searchBar.text = self.trackTitle ?: @"";
-    [self layoutHeader];
+- (void)resolveCurrentTrack {
+    NSString *sourceURL = [self spotifyURLFromTrackURI];
+    if (!sourceURL.length) {
+        [self showFallbackSearchesWithMessage:@"This track has no Spotify catalogue URL. Search across services below."];
+        return;
+    }
+
+    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://api.song.link/v1-alpha.1/links"];
+    components.queryItems = @[
+        [NSURLQueryItem queryItemWithName:@"url" value:sourceURL],
+        [NSURLQueryItem queryItemWithName:@"userCountry" value:@"DZ"]
+    ];
+    NSURL *url = components.URL;
+    if (!url) {
+        [self showFallbackSearchesWithMessage:@"Could not create the link lookup request. Search each service below."];
+        return;
+    }
+
+    [_task cancel];
+    _loading = YES;
+    _statusMessage = @"Finding this track across music services…";
+    [_items removeAllObjects];
     [self.tableView reloadData];
-    [_searchBar becomeFirstResponder];
+
+    __weak typeof(self) weakSelf = self;
+    _task = [NSURLSession.sharedSession dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) self = weakSelf;
+            if (!self) return;
+            if (error) {
+                if (error.code == NSURLErrorCancelled) return;
+                [self showFallbackSearchesWithMessage:@"Automatic matching is unavailable right now. These are direct searches on each service."];
+                return;
+            }
+            NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+            NSError *jsonError = nil;
+            id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
+            NSDictionary *links = [payload isKindOfClass:NSDictionary.class] && [payload[@"linksByPlatform"] isKindOfClass:NSDictionary.class]
+                ? payload[@"linksByPlatform"] : nil;
+            if (!http || http.statusCode < 200 || http.statusCode >= 300 || jsonError || !links.count) {
+                [self showFallbackSearchesWithMessage:@"No exact cross-platform match was returned. Search directly on each service below."];
+                return;
+            }
+
+            [self->_items removeAllObjects];
+            NSMutableSet<NSString *> *matchedKeys = [NSMutableSet set];
+            NSArray<NSString *> *order = @[@"spotify", @"appleMusic", @"itunes", @"youtubeMusic", @"youtube", @"soundcloud", @"deezer", @"tidal", @"amazonMusic", @"pandora", @"napster", @"yandex", @"anghami", @"qobuz", @"audius"];
+            for (NSString *key in order) {
+                NSDictionary *entry = [links[key] isKindOfClass:NSDictionary.class] ? links[key] : nil;
+                NSString *link = [entry[@"url"] isKindOfClass:NSString.class] ? entry[@"url"] : @"";
+                NSURL *candidateURL = [NSURL URLWithString:link];
+                if (!candidateURL || ![candidateURL.scheme.lowercaseString isEqualToString:@"https"]) continue;
+                NSString *displayName = SGRPlatformName(key);
+                [_items addObject:@{
+                    @"platformKey": key,
+                    @"platform": displayName,
+                    @"url": link,
+                    @"detail": @"Exact cross-platform match",
+                    @"isSearch": @NO
+                }];
+                [matchedKeys addObject:key];
+            }
+
+            // Always provide search links for major services that did not return a matched track.
+            NSArray<NSDictionary *> *fallbacks = [self platformSearchItemsForQuery:[self currentSearchQuery] excludingKeys:matchedKeys];
+            [self->_items addObjectsFromArray:fallbacks];
+            self->_loading = NO;
+            self->_statusMessage = self->_items.count
+                ? @"Matched links appear first; remaining rows search that service by title and artist."
+                : @"No service links were returned. Use Search to enter a title or artist.";
+            [self.tableView reloadData];
+        });
+    }];
+    [_task resume];
 }
 
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
     [searchBar resignFirstResponder];
-    [self performSearch];
-}
-
-- (NSDictionary *)normalizedAudiusTrack:(NSDictionary *)item {
-    id rawID = item[@"id"];
-    NSString *trackID = [rawID isKindOfClass:NSString.class] ? rawID :
-                        ([rawID respondsToSelector:@selector(stringValue)] ? [rawID stringValue] : @"");
-    NSString *title = [item[@"title"] isKindOfClass:NSString.class] ? item[@"title"] :
-                      ([item[@"name"] isKindOfClass:NSString.class] ? item[@"name"] : @"");
-    NSDictionary *user = [item[@"user"] isKindOfClass:NSDictionary.class] ? item[@"user"] : @{};
-    NSString *artist = [user[@"name"] isKindOfClass:NSString.class] ? user[@"name"] :
-                       ([user[@"handle"] isKindOfClass:NSString.class] ? user[@"handle"] :
-                       ([item[@"artist_name"] isKindOfClass:NSString.class] ? item[@"artist_name"] : @""));
-    if (!trackID.length || !title.length || !artist.length) return nil;
-
-    NSMutableCharacterSet *safeID = [NSMutableCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"];
-    NSString *encodedID = [trackID stringByAddingPercentEncodingWithAllowedCharacters:safeID];
-    if (!encodedID.length) return nil;
-
-    NSString *permalink = [item[@"permalink"] isKindOfClass:NSString.class] ? item[@"permalink"] : @"";
-    if (permalink.length && ![permalink.lowercaseString hasPrefix:@"http"]) {
-        while ([permalink hasPrefix:@"/"]) permalink = [permalink substringFromIndex:1];
-        permalink = [@"https://audius.co/" stringByAppendingString:permalink];
-    }
-
-    NSMutableDictionary *normalized = [item mutableCopy];
-    normalized[@"id"] = trackID;
-    normalized[@"name"] = title;
-    normalized[@"artist_name"] = artist;
-    normalized[@"duration"] = item[@"duration"] ?: @0;
-    normalized[@"album_name"] = @"";
-    normalized[@"audiodownload"] = [NSString stringWithFormat:@"https://api.audius.co/v1/tracks/%@/download", encodedID];
-    id canDownload = item[@"is_downloadable"] ?: item[@"isDownloadable"] ?: item[@"downloadable"];
-    normalized[@"audiodownload_allowed"] = @([canDownload respondsToSelector:@selector(boolValue)] && [canDownload boolValue]);
-    normalized[@"_vitrineProvider"] = @"Audius";
-    normalized[@"shareurl"] = permalink;
-    normalized[@"license_ccurl"] = [item[@"license_url"] isKindOfClass:NSString.class] ? item[@"license_url"] : @"";
-    return normalized;
-}
-
-- (double)searchScoreForTrack:(NSDictionary *)track query:(NSString *)query {
-    NSString *title = [track[@"name"] isKindOfClass:NSString.class] ? track[@"name"] : @"";
-    NSString *artist = [track[@"artist_name"] isKindOfClass:NSString.class] ? track[@"artist_name"] : @"";
-    NSString *album = [track[@"album_name"] isKindOfClass:NSString.class] ? track[@"album_name"] : @"";
-    NSString *candidate = [[@[title, artist, album] componentsJoinedByString:@" "]
-                           stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    NSString *normalizedQuery = SGDownloadNormalize(query);
-    NSString *normalizedCandidate = SGDownloadNormalize(candidate);
-    if (!normalizedQuery.length || !normalizedCandidate.length) return 0;
-    if ([normalizedCandidate containsString:normalizedQuery]) return 1.0;
-    return SGDownloadSimilarity(normalizedQuery, normalizedCandidate);
-}
-
-- (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items {
-    NSDictionary *best = nil;
-    double bestScore = -1;
-    for (NSDictionary *item in items) {
-        NSString *candidateTitle = [item[@"name"] isKindOfClass:NSString.class] ? item[@"name"] : @"";
-        NSString *candidateArtist = [item[@"artist_name"] isKindOfClass:NSString.class] ? item[@"artist_name"] : @"";
-        double titleScore = SGDownloadSimilarity(self.trackTitle, candidateTitle);
-        double artistScore = SGDownloadSimilarity(self.artistName, candidateArtist);
-        if (titleScore <= 0 || artistScore <= 0) continue;
-
-        double durationScore = 0;
-        double durationDelta = DBL_MAX;
-        double candidateDuration = [item[@"duration"] respondsToSelector:@selector(doubleValue)] ? [item[@"duration"] doubleValue] : 0;
-        BOOL hasDuration = self.trackDuration > 0 && candidateDuration > 0;
-        if (hasDuration) {
-            durationDelta = fabs(self.trackDuration - candidateDuration);
-            durationScore = durationDelta <= 3 ? 1.0 : durationDelta <= 7 ? 0.8 : durationDelta <= 14 ? 0.5 : durationDelta <= 20 ? 0.2 : 0.0;
-        }
-        double score = hasDuration
-            ? (0.60 * titleScore + 0.33 * artistScore + 0.07 * durationScore)
-            : (0.64 * titleScore + 0.36 * artistScore);
-        NSMutableDictionary *scored = [item mutableCopy];
-        scored[@"_vitrineScore"] = @(score);
-        scored[@"_vitrineTitleScore"] = @(titleScore);
-        scored[@"_vitrineArtistScore"] = @(artistScore);
-        if (hasDuration) scored[@"_vitrineDurationDelta"] = @(durationDelta);
-        if (score > bestScore) {
-            best = scored;
-            bestScore = score;
-        }
-    }
-    return best;
-}
-
-- (BOOL)isConfidentMatch:(NSDictionary *)item {
-    if (![item isKindOfClass:NSDictionary.class]) return NO;
-    double score = [item[@"_vitrineScore"] doubleValue];
-    double titleScore = [item[@"_vitrineTitleScore"] doubleValue];
-    double artistScore = [item[@"_vitrineArtistScore"] doubleValue];
-    NSNumber *durationDelta = item[@"_vitrineDurationDelta"];
-    // Only auto-download very strong matches. A similar title or artist isn't enough to claim it is the same recording.
-    if (durationDelta && durationDelta.doubleValue > 12.0) return NO;
-    return score >= 0.90 && titleScore >= 0.95 && artistScore >= 0.75;
-}
-
-- (void)performSearch {
-    [self performSearchWithBroadFallback:NO];
-}
-
-- (void)performSearchWithBroadFallback:(BOOL)broadFallback {
-    if (_segments.selectedSegmentIndex != 0) _segments.selectedSegmentIndex = 0;
-
-    // Audius has a read-only search endpoint; no client ID or manual API setup is required.
-    // Automatic mode starts with the playing title, then retries with title + artist.
-    // Manual mode is an explicit fallback and uses what the user typed.
-    NSString *query = _manualSearch
-        ? [_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
-        : [self.trackTitle stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (!query.length && !_manualSearch) {
-        query = [self.artistName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    }
-    // If title-only lookup is too narrow, retry with both title and artist.
-    if (!_manualSearch && broadFallback) {
-        query = [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
-                 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    }
-    if (!query.length) {
-        _searchMessage = @"No current track title is available.";
-        [_results removeAllObjects];
+    NSString *query = [searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!query.length) query = [self currentSearchQuery];
+    [self showFallbackSearchesWithMessage:@"Showing direct searches for your query across major music services."];
+    if (query.length) {
+        [_items removeAllObjects];
+        [_items addObjectsFromArray:[self platformSearchItemsForQuery:query excludingKeys:[NSSet set]]];
         [self.tableView reloadData];
-        return;
     }
-
-    NSURLComponents *components = [NSURLComponents componentsWithString:@"https://api.audius.co/v1/tracks/search"];
-    NSMutableArray<NSURLQueryItem *> *queryItems = [@[
-        [NSURLQueryItem queryItemWithName:@"query" value:query],
-        [NSURLQueryItem queryItemWithName:@"limit" value:@"50"],
-        [NSURLQueryItem queryItemWithName:@"sort_method" value:@"relevant"],
-        [NSURLQueryItem queryItemWithName:@"app_name" value:@"Vitrine"]
-    ] mutableCopy];
-    // Duration remains a local ranking signal so alternate versions are not filtered out prematurely.
-    components.queryItems = queryItems;
-    NSURL *url = components.URL;
-    if (!url) return;
-
-    [_searchTask cancel];
-    _searching = YES;
-    _searchMessage = _manualSearch ? @"Searching Audius for downloadable tracks…" : @"Matching the current track on Audius…";
-    [_results removeAllObjects];
-    [self.tableView reloadData];
-
-    __weak typeof(self) weakSelf = self;
-    _searchTask = [NSURLSession.sharedSession dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            typeof(self) self = weakSelf;
-            if (!self) return;
-            self->_searching = NO;
-            if (error) {
-                if (error.code == NSURLErrorCancelled) return;
-                self->_searchMessage = @"Audius lookup failed. Check the connection and try again.";
-                [self.tableView reloadData];
-                return;
-            }
-            NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
-            if (http && (http.statusCode < 200 || http.statusCode >= 300)) {
-                self->_searchMessage = [NSString stringWithFormat:@"The music catalogue returned HTTP %ld.", (long)http.statusCode];
-                [self.tableView reloadData];
-                return;
-            }
-            NSError *jsonError = nil;
-            id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
-            if (![payload isKindOfClass:NSDictionary.class] || jsonError ||
-                ![payload[@"data"] isKindOfClass:NSArray.class]) {
-                NSString *detail = [payload isKindOfClass:NSDictionary.class] && [payload[@"error"] isKindOfClass:NSString.class]
-                    ? payload[@"error"] : @"The Audius API returned an unreadable response.";
-                self->_searchMessage = detail;
-                [self.tableView reloadData];
-                return;
-            }
-            NSArray *items = payload[@"data"];
-            NSMutableArray<NSDictionary *> *catalogueResults = [NSMutableArray array];
-            NSMutableArray<NSDictionary *> *permitted = [NSMutableArray array];
-            for (id candidate in items) {
-                if (![candidate isKindOfClass:NSDictionary.class]) continue;
-                NSDictionary *raw = candidate;
-                id canDownload = raw[@"is_downloadable"] ?: raw[@"isDownloadable"] ?: raw[@"downloadable"];
-                id streamGated = raw[@"is_stream_gated"] ?: raw[@"isStreamGated"] ?: @NO;
-                id downloadGated = raw[@"is_download_gated"] ?: raw[@"isDownloadGated"] ?: @NO;
-                id downloadConditions = raw[@"download_conditions"] ?: raw[@"downloadConditions"];
-                BOOL hasDownloadConditions = [downloadConditions isKindOfClass:NSDictionary.class] &&
-                                             [(NSDictionary *)downloadConditions count] > 0;
-                BOOL downloadEnabled = [canDownload respondsToSelector:@selector(boolValue)] && [canDownload boolValue];
-                BOOL streamIsGated = [streamGated respondsToSelector:@selector(boolValue)] && [streamGated boolValue];
-                BOOL downloadIsGated = [downloadGated respondsToSelector:@selector(boolValue)] && [downloadGated boolValue];
-                // Keep all search matches visible. Only tracks whose metadata explicitly enables download
-                // and does not indicate gated access may enter the download queue.
-                NSDictionary *normalizedRaw = [self normalizedAudiusTrack:raw];
-                if (!normalizedRaw) continue;
-                NSMutableDictionary *normalized = [normalizedRaw mutableCopy];
-                BOOL canActuallyDownload = downloadEnabled && !streamIsGated && !downloadIsGated && !hasDownloadConditions;
-                normalized[@"audiodownload_allowed"] = @(canActuallyDownload);
-                [catalogueResults addObject:normalized];
-                if (canActuallyDownload) [permitted addObject:normalized];
-            }
-
-            if (self->_manualSearch) {
-                // The API sometimes returns loosely related results for short queries. Rank by
-                // the actual title/artist/album text and discard unrelated tracks before showing them.
-                NSString *manualQuery = [self->_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-                [catalogueResults sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-                    double leftScore = [self searchScoreForTrack:left query:manualQuery];
-                    double rightScore = [self searchScoreForTrack:right query:manualQuery];
-                    if (leftScore > rightScore) return NSOrderedAscending;
-                    if (leftScore < rightScore) return NSOrderedDescending;
-                    return NSOrderedSame;
-                }];
-                NSMutableArray<NSDictionary *> *related = [NSMutableArray array];
-                for (NSDictionary *candidate in catalogueResults) {
-                    if ([self searchScoreForTrack:candidate query:manualQuery] >= 0.34) [related addObject:candidate];
-                }
-                if (related.count > 8) {
-                    related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
-                }
-                self->_results = related;
-                self->_searchMessage = related.count ? nil : @"No relevant tracks were found for that title or artist on Audius.";
-            } else {
-                NSDictionary *best = [self bestMatchFrom:permitted];
-                if ([self isConfidentMatch:best]) {
-                    self->_results = [NSMutableArray arrayWithObject:best];
-                    self->_searchMessage = nil;
-                    [self enqueueTrack:best atFront:YES];
-                } else if (!broadFallback) {
-                    // Retry once with title + artist instead of concluding there are no matches.
-                    [self performSearchWithBroadFallback:YES];
-                    return;
-                } else {
-                    NSString *currentQuery = [[@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "]
-                                               stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-                    [catalogueResults sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-                        double leftScore = [self searchScoreForTrack:left query:currentQuery];
-                        double rightScore = [self searchScoreForTrack:right query:currentQuery];
-                        if (leftScore > rightScore) return NSOrderedAscending;
-                        if (leftScore < rightScore) return NSOrderedDescending;
-                        return NSOrderedSame;
-                    }];
-                    NSMutableArray<NSDictionary *> *related = [NSMutableArray array];
-                    for (NSDictionary *candidate in catalogueResults) {
-                        if ([self searchScoreForTrack:candidate query:currentQuery] >= 0.34) [related addObject:candidate];
-                    }
-                    if (related.count > 8) {
-                        related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
-                    }
-                    self->_results = related;
-                    self->_searchMessage = related.count ? nil : @"No relevant matches were found in Audius's catalog.";
-                }
-            }
-            [self.tableView reloadData];
-        });
-    }];
-    [_searchTask resume];
-}
-
-- (NSString *)downloadsDirectory {
-    NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
-    return [support stringByAppendingPathComponent:@"Vitrine/Downloads"];
-}
-
-- (void)ensureDownloadsDirectory {
-    NSError *error = nil;
-    if (![NSFileManager.defaultManager createDirectoryAtPath:[self downloadsDirectory]
-                                 withIntermediateDirectories:YES attributes:nil error:&error]) {
-        SGLog(@"authorized downloads: could not create library folder: %@", error);
-    }
-}
-
-- (BOOL)isSavedTrackID:(NSString *)trackID {
-    for (NSDictionary *entry in _library) if ([entry[@"id"] isEqualToString:trackID]) return YES;
-    return NO;
-}
-
-- (NSString *)licenseURLForTrack:(NSDictionary *)track {
-    NSString *licenseURL = [track[@"license_ccurl"] isKindOfClass:NSString.class] ? track[@"license_ccurl"] : @"";
-    if (!licenseURL.length && [track[@"license_url"] isKindOfClass:NSString.class]) licenseURL = track[@"license_url"];
-    return licenseURL;
-}
-
-- (NSString *)licenseForTrack:(NSDictionary *)track {
-    NSString *url = [self licenseURLForTrack:track].lowercaseString;
-    if ([url containsString:@"/licenses/by-nc-sa/"]) return @"CC BY-NC-SA — attribution, non-commercial, share-alike";
-    if ([url containsString:@"/licenses/by-nc-nd/"]) return @"CC BY-NC-ND — attribution, non-commercial, no derivatives";
-    if ([url containsString:@"/licenses/by-nc/"]) return @"CC BY-NC — attribution, non-commercial";
-    if ([url containsString:@"/licenses/by-sa/"]) return @"CC BY-SA — attribution, share-alike";
-    if ([url containsString:@"/licenses/by-nd/"]) return @"CC BY-ND — attribution, no derivatives";
-    if ([url containsString:@"/licenses/by/"]) return @"CC BY — attribution";
-    if ([track[@"_vitrineProvider"] isEqualToString:@"Audius"]) {
-        return url.length ? @"Creator-enabled Audius download — review license" : @"Audius uploader enabled downloads — review the uploader's terms";
-    }
-    return url.length ? @"Track licence — open licence details" : @"Provider-enabled download";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (_segments.selectedSegmentIndex == 1) return MAX(1, (NSInteger)_library.count);
-    if (_searching && !_results.count) return 1;
-    if (!_results.count) return 1;
-    return (NSInteger)_results.count;
+    return _loading || !_items.count ? 1 : (NSInteger)_items.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    BOOL libraryMode = _segments.selectedSegmentIndex == 1;
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:libraryMode ? @"saved" : @"result"];
-    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:libraryMode ? @"saved" : @"result"];
+    static NSString *reuseID = @"serviceLink";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
     cell.accessoryView = nil;
     cell.accessoryType = UITableViewCellAccessoryNone;
-    cell.selectionStyle = libraryMode ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
     cell.textLabel.numberOfLines = 2;
     cell.detailTextLabel.numberOfLines = 2;
-    cell.imageView.image = nil;
 
-    if (libraryMode) {
-        if (_library.count == 0) {
-            cell.textLabel.text = @"Your Vitrine library is empty";
-            cell.detailTextLabel.text = @"Search Audius for creator-enabled downloads, then save a track to this library.";
-            cell.textLabel.textColor = UIColor.secondaryLabelColor;
-            return cell;
-        }
-        NSDictionary *entry = _library[(NSUInteger)indexPath.row];
-        cell.textLabel.text = entry[@"title"] ?: @"Unknown track";
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@\n%@", entry[@"artist"] ?: @"Unknown artist", entry[@"license"] ?: @"License information unavailable"];
-        cell.textLabel.textColor = UIColor.labelColor;
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        return cell;
-    }
-
-    if (_searching || !_results.count) {
-        cell.textLabel.text = _searchMessage ?: @"Search for a song or artist";
-        cell.detailTextLabel.text = _searching ? @"Please wait…" : @"Matching tracks appear here; a lock means the uploader has not enabled downloads.";
+    if (_loading || !_items.count) {
+        cell.textLabel.text = _loading ? @"Searching music services…" : (_statusMessage ?: @"No service links available.");
+        cell.detailTextLabel.text = _loading ? @"Please wait…" : @"Tap Search to look up another title or artist.";
         cell.textLabel.textColor = UIColor.secondaryLabelColor;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
         return cell;
     }
 
-    NSDictionary *track = _results[(NSUInteger)indexPath.row];
-    NSString *trackID = [track[@"id"] description];
-    NSString *artist = [track[@"artist_name"] isKindOfClass:NSString.class] ? track[@"artist_name"] : @"Unknown artist";
-    NSString *album = [track[@"album_name"] isKindOfClass:NSString.class] ? track[@"album_name"] : @"";
-    cell.textLabel.text = track[@"name"];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@%@\n%@", artist, album.length ? [@" · " stringByAppendingString:album] : @"", [self licenseForTrack:track]];
+    NSDictionary *item = _items[(NSUInteger)indexPath.row];
+    cell.textLabel.text = item[@"platform"] ?: @"Music service";
+    cell.detailTextLabel.text = item[@"detail"] ?: @"Open service";
     cell.textLabel.textColor = UIColor.labelColor;
-
-    NSString *state = _states[trackID];
-    BOOL saved = [self isSavedTrackID:trackID];
-    if (![track[@"audiodownload_allowed"] boolValue]) {
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@\nNot downloadable on Audius — uploader has not enabled downloads or access is restricted.", artist];
-        cell.accessoryView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"lock.fill"]];
-        ((UIImageView *)cell.accessoryView).tintColor = UIColor.secondaryLabelColor;
-        return cell;
-    }
-    if (saved) {
-        cell.accessoryView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"checkmark.circle.fill"]];
-        ((UIImageView *)cell.accessoryView).tintColor = UIColor.systemGreenColor;
-    } else if ([state isEqualToString:@"Queued"]) {
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"Queued · %@", cell.detailTextLabel.text];
-        cell.accessoryView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"clock"]];
-        ((UIImageView *)cell.accessoryView).tintColor = UIColor.secondaryLabelColor;
-    } else if ([state isEqualToString:@"Downloading"]) {
-        NSInteger percent = (NSInteger)round(_progress[trackID].doubleValue * 100);
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"Downloading · %ld%%\n%@", (long)percent, [self licenseForTrack:track]];
-        UIProgressView *bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
-        bar.frame = CGRectMake(0, 0, 56, 4);
-        bar.progress = _progress[trackID].floatValue;
-        cell.accessoryView = bar;
-    } else if ([state isEqualToString:@"Failed"]) {
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"Download failed · tap arrow to retry\n%@", [self licenseForTrack:track]];
-        UIButton *retry = [UIButton buttonWithType:UIButtonTypeSystem];
-        retry.frame = CGRectMake(0, 0, 36, 36);
-        [retry setImage:[UIImage systemImageNamed:@"arrow.clockwise.circle"] forState:UIControlStateNormal];
-        retry.tintColor = UIColor.systemOrangeColor;
-        retry.tag = indexPath.row;
-        [retry addTarget:self action:@selector(downloadPressed:) forControlEvents:UIControlEventTouchUpInside];
-        cell.accessoryView = retry;
-    } else {
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.frame = CGRectMake(0, 0, 36, 36);
-        [button setImage:[UIImage systemImageNamed:@"arrow.down.circle"] forState:UIControlStateNormal];
-        button.tintColor = self.view.tintColor;
-        button.tag = indexPath.row;
-        [button addTarget:self action:@selector(downloadPressed:) forControlEvents:UIControlEventTouchUpInside];
-        cell.accessoryView = button;
-    }
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     return cell;
-}
-
-- (void)downloadPressed:(UIButton *)sender {
-    if (sender.tag < 0 || sender.tag >= (NSInteger)_results.count) return;
-    NSDictionary *track = _results[(NSUInteger)sender.tag];
-    NSString *trackID = [track[@"id"] description];
-    if ([self isSavedTrackID:trackID] || [_states[trackID] isEqualToString:@"Queued"] || [_states[trackID] isEqualToString:@"Downloading"]) return;
-    if (![track[@"audiodownload_allowed"] boolValue]) {
-        UIAlertController *unavailable = [UIAlertController alertControllerWithTitle:@"Download unavailable"
-                                                                             message:@"The uploader has not enabled downloads for this Audius track, or access is restricted. Vitrine cannot download this track from Audius."
-                                                                      preferredStyle:UIAlertControllerStyleAlert];
-        [unavailable addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:unavailable animated:YES completion:nil];
-        return;
-    }
-
-    NSString *license = [self licenseForTrack:track];
-    UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"Download track?"
-                                                                          message:[NSString stringWithFormat:@"%@ — %@\n\nAudius reports that the uploader enabled downloads. Check the uploader's terms before reusing or redistributing the file.\n\n%@", track[@"name"] ?: @"Track", track[@"artist_name"] ?: @"Unknown artist", license]
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-    [confirmation addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [confirmation addAction:[UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [self enqueueTrack:track atFront:NO];
-    }]];
-    [self presentViewController:confirmation animated:YES completion:nil];
-}
-
-- (void)enqueueTrack:(NSDictionary *)track atFront:(BOOL)front {
-    NSString *trackID = [track[@"id"] description];
-    if (!trackID.length || [self isSavedTrackID:trackID]) return;
-    if ([[_activeTrack[@"id"] description] isEqualToString:trackID]) return;
-    for (NSDictionary *queued in _queue) if ([[queued[@"id"] description] isEqualToString:trackID]) return;
-    if (front) [_queue insertObject:track atIndex:0];
-    else [_queue addObject:track];
-    _states[trackID] = @"Queued";
-    [self.tableView reloadData];
-    [self startNextDownload];
-}
-
-- (BOOL)isAllowedAudiusDownloadURL:(NSURL *)url {
-    NSString *scheme = url.scheme.lowercaseString;
-    NSString *host = url.host.lowercaseString;
-    BOOL validHost = [host isEqualToString:@"api.audius.co"] ||
-                     [host isEqualToString:@"discoveryprovider.audius.co"];
-    return [scheme isEqualToString:@"https"] && validHost;
-}
-
-- (void)startNextDownload {
-    if (_activeTask || !_queue.count) return;
-    NSDictionary *track = _queue.firstObject;
-    [_queue removeObjectAtIndex:0];
-    NSURL *url = [NSURL URLWithString:track[@"audiodownload"] ?: @""];
-    NSString *trackID = [track[@"id"] description];
-    if (![self isAllowedAudiusDownloadURL:url]) {
-        _states[trackID] = @"Failed";
-        [self.tableView reloadData];
-        [self startNextDownload];
-        return;
-    }
-    _activeTrack = track;
-    _finishedPath = nil;
-    _downloadFailureReason = nil;
-    _progress[trackID] = @0;
-    _states[trackID] = @"Downloading";
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    _activeTask = [_downloadSession downloadTaskWithRequest:request];
-    _activeTask.taskDescription = trackID;
-    [self.tableView reloadData];
-    [_activeTask resume];
-}
-
-- (NSString *)safeExtensionForResponse:(NSURLResponse *)response originalURL:(NSURL *)url {
-    NSString *ext = response.suggestedFilename.pathExtension.lowercaseString;
-    NSSet *allowed = [NSSet setWithArray:@[@"mp3", @"m4a", @"aac", @"ogg", @"opus", @"flac", @"wav", @"aiff", @"aif", @"mp4"]];
-    if (![allowed containsObject:ext]) ext = url.pathExtension.lowercaseString;
-    if (![allowed containsObject:ext]) {
-        NSString *mime = response.MIMEType.lowercaseString;
-        if ([mime isEqualToString:@"audio/mpeg"] || [mime isEqualToString:@"audio/mp3"]) ext = @"mp3";
-        else if ([mime isEqualToString:@"audio/mp4"] || [mime isEqualToString:@"audio/x-m4a"]) ext = @"m4a";
-        else if ([mime isEqualToString:@"audio/aac"]) ext = @"aac";
-        else if ([mime isEqualToString:@"audio/ogg"]) ext = @"ogg";
-        else if ([mime isEqualToString:@"audio/flac"] || [mime isEqualToString:@"audio/x-flac"]) ext = @"flac";
-        else if ([mime isEqualToString:@"audio/wav"] || [mime isEqualToString:@"audio/x-wav"] || [mime isEqualToString:@"audio/wave"]) ext = @"wav";
-        else if ([mime isEqualToString:@"audio/aiff"] || [mime isEqualToString:@"audio/x-aiff"]) ext = @"aiff";
-    }
-    return [allowed containsObject:ext] ? ext : nil;
-}
-
-- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask
-      didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten
-totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
-    NSString *trackID = downloadTask.taskDescription;
-    if (totalBytesExpectedToWrite > 0) _progress[trackID] = @(MIN(1.0, (double)totalBytesWritten / (double)totalBytesExpectedToWrite));
-    [self.tableView reloadData];
-}
-
-- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask
- didFinishDownloadingToURL:(NSURL *)location {
-    NSHTTPURLResponse *http = [downloadTask.response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)downloadTask.response : nil;
-    NSString *mime = http.MIMEType.lowercaseString ?: @"";
-    if (!http || http.statusCode < 200 || http.statusCode >= 300) {
-        _downloadFailureReason = [NSString stringWithFormat:@"HTTP %ld", (long)http.statusCode];
-        return;
-    }
-    // Only audio responses are persisted; generic binary responses still need a recognized audio extension.
-    NSString *ext = [self safeExtensionForResponse:http originalURL:downloadTask.originalRequest.URL];
-    BOOL audioType = [mime hasPrefix:@"audio/"];
-    if ((!audioType && ![mime isEqualToString:@"application/octet-stream"]) || !ext) {
-        _downloadFailureReason = @"The provider did not return a supported audio file.";
-        return;
-    }
-    NSString *trackID = [_activeTrack[@"id"] description] ?: @"track";
-    NSString *filename = [NSString stringWithFormat:@"%@.%@", trackID, ext];
-    NSString *path = [[self downloadsDirectory] stringByAppendingPathComponent:filename];
-    NSError *moveError = nil;
-    [NSFileManager.defaultManager removeItemAtPath:path error:nil];
-    if (![NSFileManager.defaultManager moveItemAtURL:location toURL:[NSURL fileURLWithPath:path] error:&moveError]) {
-        _downloadFailureReason = moveError.localizedDescription ?: @"Could not save the downloaded file.";
-        return;
-    }
-    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
-    if ([attributes[NSFileSize] unsignedLongLongValue] == 0) {
-        [NSFileManager.defaultManager removeItemAtPath:path error:nil];
-        _downloadFailureReason = @"The downloaded file was empty.";
-        return;
-    }
-    _finishedPath = path;
-}
-
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
-    if (task != _activeTask) return;
-    NSDictionary *track = _activeTrack;
-    NSString *trackID = [track[@"id"] description] ?: @"";
-    NSString *failure = error.localizedDescription ?: _downloadFailureReason;
-
-    if (!error && _finishedPath.length && !_downloadFailureReason) {
-        NSMutableDictionary *entry = [@{
-            @"id": trackID,
-            @"title": [track[@"name"] isKindOfClass:NSString.class] ? track[@"name"] : @"Unknown track",
-            @"artist": [track[@"artist_name"] isKindOfClass:NSString.class] ? track[@"artist_name"] : @"Unknown artist",
-            @"album": [track[@"album_name"] isKindOfClass:NSString.class] ? track[@"album_name"] : @"",
-            @"license": [self licenseForTrack:track],
-            @"licenseURL": [self licenseURLForTrack:track],
-            @"filename": _finishedPath.lastPathComponent,
-            @"source": [track[@"shareurl"] isKindOfClass:NSString.class] ? track[@"shareurl"] : @"",
-            @"added": @((long long)NSDate.date.timeIntervalSince1970)
-        } mutableCopy];
-        [_library removeObjectsAtIndexes:[_library indexesOfObjectsPassingTest:^BOOL(NSDictionary *obj, NSUInteger idx, BOOL *stop) {
-            return [obj[@"id"] isEqualToString:trackID];
-        }]];
-        [_library insertObject:entry atIndex:0];
-        [NSUserDefaults.standardUserDefaults setObject:_library forKey:kSGAuthorizedLibraryKey];
-        _states[trackID] = @"Saved";
-        [_progress removeObjectForKey:trackID];
-        SGLog(@"authorized downloads: saved %@ by %@", entry[@"title"], entry[@"artist"]);
-    } else {
-        _states[trackID] = @"Failed";
-        [_progress removeObjectForKey:trackID];
-        if (_finishedPath.length) [NSFileManager.defaultManager removeItemAtPath:_finishedPath error:nil];
-        SGLog(@"authorized downloads: %@ failed: %@", trackID, failure ?: @"unknown download error");
-    }
-    _activeTask = nil;
-    _activeTrack = nil;
-    _finishedPath = nil;
-    _downloadFailureReason = nil;
-    [self.tableView reloadData];
-    [self startNextDownload];
-    if (_closing && !_activeTask && !_queue.count) [_downloadSession finishTasksAndInvalidate];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (_segments.selectedSegmentIndex != 1 || indexPath.row >= (NSInteger)_library.count) return;
-    NSDictionary *entry = _library[(NSUInteger)indexPath.row];
-    NSString *path = [[self downloadsDirectory] stringByAppendingPathComponent:entry[@"filename"] ?: @""];
-    if (![NSFileManager.defaultManager fileExistsAtPath:path]) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"File not found"
-                                                                       message:@"This file is missing from Vitrine's download folder."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Remove entry" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-            [self deleteEntryAtIndex:indexPath.row];
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:entry[@"title"] ?: @"Downloaded track"
-                                                                   message:[NSString stringWithFormat:@"%@\n%@", entry[@"artist"] ?: @"", entry[@"license"] ?: @""]
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Share / export file" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
-        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
-        activity.popoverPresentationController.sourceView = cell;
-        activity.popoverPresentationController.sourceRect = cell.bounds;
-        [self presentViewController:activity animated:YES completion:nil];
-    }]];
-    NSString *licenseURL = [entry[@"licenseURL"] isKindOfClass:NSString.class] ? entry[@"licenseURL"] : @"";
-    if (licenseURL.length) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"View licence" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            NSURL *url = [NSURL URLWithString:licenseURL];
-            if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
-        }]];
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Delete from Vitrine" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self deleteEntryAtIndex:indexPath.row];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceView = [tableView cellForRowAtIndexPath:indexPath];
-    sheet.popoverPresentationController.sourceRect = [tableView cellForRowAtIndexPath:indexPath].bounds;
-    [self presentViewController:sheet animated:YES completion:nil];
-}
-
-- (void)deleteEntryAtIndex:(NSInteger)index {
-    if (index < 0 || index >= (NSInteger)_library.count) return;
-    NSDictionary *entry = _library[(NSUInteger)index];
-    NSString *path = [[self downloadsDirectory] stringByAppendingPathComponent:entry[@"filename"] ?: @""];
-    [NSFileManager.defaultManager removeItemAtPath:path error:nil];
-    [_library removeObjectAtIndex:(NSUInteger)index];
-    [NSUserDefaults.standardUserDefaults setObject:_library forKey:kSGAuthorizedLibraryKey];
-    [self.tableView reloadData];
+    if (_loading || indexPath.row >= (NSInteger)_items.count) return;
+    NSString *link = _items[(NSUInteger)indexPath.row][@"url"];
+    NSURL *url = [NSURL URLWithString:link ?: @""];
+    if (!url || ![url.scheme.lowercaseString isEqualToString:@"https"]) return;
+    [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
 }
 
 @end
 
-void SGRAuthorizedDownloadsPresent(UIView *source, NSString *trackTitle, NSString *artistName, NSTimeInterval duration) {
+void SGRTrackLinksPresent(UIView *source, NSString *trackTitle, NSString *artistName, NSString *trackURI) {
     UIWindow *window = source.window;
     UIViewController *presenter = window.rootViewController;
     if (!presenter) return;
     while (presenter.presentedViewController) presenter = presenter.presentedViewController;
-    SGAuthorizedDownloadsController *page = [[SGAuthorizedDownloadsController alloc] initWithTitle:trackTitle ?: @"" artist:artistName ?: @"" duration:duration];
+    SGRTrackLinksController *page = [[SGRTrackLinksController alloc] initWithTitle:trackTitle ?: @""
+                                                                           artist:artistName ?: @""
+                                                                          trackURI:trackURI ?: @""];
     UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:page];
     navigation.modalPresentationStyle = UIModalPresentationPageSheet;
     if (@available(iOS 15.0, *)) {
