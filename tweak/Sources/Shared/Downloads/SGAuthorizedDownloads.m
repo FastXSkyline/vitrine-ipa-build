@@ -358,7 +358,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
             }
             NSError *jsonError = nil;
             id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
-            if (![payload isKindOfClass:NSDictionary.class] || jsonError || [payload[@"headers"] isKindOfClass:NSDictionary.class] && [payload[@"results"] isKindOfClass:NSArray.class] == NO) {
+            if (![payload isKindOfClass:NSDictionary.class] || jsonError || ([payload[@"headers"] isKindOfClass:NSDictionary.class] && [payload[@"results"] isKindOfClass:NSArray.class] == NO)) {
                 self->_searchMessage = @"The music catalogue returned an unreadable response.";
                 [self.tableView reloadData];
                 return;
