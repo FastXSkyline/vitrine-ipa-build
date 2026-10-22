@@ -13,7 +13,7 @@
 #import "Redesigned/ContextMenu/ContextMenu.h"
 #import "Shared/Player/PlayerState.h"
 #import "Shared/Player/SpeedPitch.h"
-#import "Shared/Downloads/SGAuthorizedDownloads.h"
+#import "Shared/MusicLinks/SGRTrackLinks.h"
 #import "Player.h"
 
 static __weak UIView *sg_moreButton;   // the ⋯ the sliders' panel comes from
