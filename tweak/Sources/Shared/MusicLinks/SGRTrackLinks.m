@@ -288,9 +288,10 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
     NSArray<NSString *> *tokens = SGRSearchTokens(_trackTitle);
     if (tokens.count == 0) return nil;
 
+    // Search title metadata broadly first. Internet Archive search responses can omit licenseurl
+    // even when the full metadata record includes it, so license validation happens after lookup.
     NSString *titleClause = [tokens componentsJoinedByString:@" AND "];
-    NSString *licenseClause = @"(licenseurl:http*creativecommons.org/licenses/by/* OR licenseurl:http*creativecommons.org/licenses/by-sa/* OR licenseurl:http*creativecommons.org/licenses/by-nc/* OR licenseurl:http*creativecommons.org/licenses/by-nc-sa/* OR licenseurl:http*creativecommons.org/licenses/by-nd/* OR licenseurl:http*creativecommons.org/licenses/by-nc-nd/* OR licenseurl:http*creativecommons.org/publicdomain/zero/* OR licenseurl:http*creativecommons.org/publicdomain/mark/*)";
-    NSString *query = [NSString stringWithFormat:@"mediatype:audio AND title:(%@) AND %@", titleClause, licenseClause];
+    NSString *query = [NSString stringWithFormat:@"mediatype:audio AND title:(%@)", titleClause];
 
     NSURLComponents *components = [NSURLComponents componentsWithString:@"https://archive.org/advancedsearch.php"];
     components.queryItems = @[
@@ -368,7 +369,6 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
             NSString *candidateCreator = SGRStringValue(doc[@"creator"]);
             NSString *candidateLicense = SGRStringValue(doc[@"licenseurl"]);
             if (!identifier.length || !candidateTitle.length || [seenIdentifiers containsObject:identifier]) continue;
-            if (!SGRHasAllowedLicenseURL(candidateLicense)) continue;
 
             double titleScore = SGRTextSimilarity(requestedTitle, candidateTitle);
             NSArray *requestedTokens = SGRSearchTokens(requestedTitle);
@@ -473,7 +473,7 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
             if (sorted.count) {
                 [self setStatus:[NSString stringWithFormat:@"Found %lu openly licensed MP3 match%@. Tap one to download it.", (unsigned long)sorted.count, sorted.count == 1 ? @"" : @"es"]];
             } else {
-                [self setStatus:@"No matching openly licensed MP3 was found. This catalog does not contain most mainstream commercial releases."];
+                [self setStatus:@"No matching MP3 with a verified Creative Commons/public-domain license was found in Internet Archive. Most mainstream commercial hits are not available as openly licensed downloads."];
             }
         });
     }];
