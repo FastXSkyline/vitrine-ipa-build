@@ -405,13 +405,21 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
                     [self performSearchWithBroadFallback:YES];
                     return;
                 } else {
-                    // Show permitted provider results as manual choices instead of hiding everything
-                    // just because a candidate did not pass the automatic-match threshold.
-                    if (permitted.count > 8) {
-                        permitted = [[permitted subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                    // Show only plausible title/artist-related tracks as manual choices; do not
+                    // fill the screen with unrelated results from full-text/tag matching.
+                    NSMutableArray<NSDictionary *> *related = [NSMutableArray array];
+                    for (NSDictionary *candidate in permitted) {
+                        double titleSimilarity = SGDownloadSimilarity(self.trackTitle, candidate[@"name"]);
+                        double artistSimilarity = SGDownloadSimilarity(self.artistName, candidate[@"artist_name"]);
+                        if (titleSimilarity >= 0.34 || artistSimilarity >= 0.50) {
+                            [related addObject:candidate];
+                        }
                     }
-                    self->_results = permitted;
-                    self->_searchMessage = permitted.count ? nil : @"No downloadable tracks were found in Jamendo for this title. Its catalogue does not include every commercial Spotify release.";
+                    if (related.count > 8) {
+                        related = [[related subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                    }
+                    self->_results = related;
+                    self->_searchMessage = related.count ? nil : @"No downloadable match was found in Jamendo. Its catalogue does not include every commercial Spotify release.";
                 }
             }
             [self.tableView reloadData];
