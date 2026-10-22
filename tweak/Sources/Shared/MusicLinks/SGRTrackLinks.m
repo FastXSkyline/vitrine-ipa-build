@@ -158,8 +158,6 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
 @implementation SGRTrackLinksController {
     NSString *_trackTitle;
     NSString *_artistName;
-    NSString *_trackURI;
-    NSTimeInterval _duration;
     NSURLSession *_session;
     NSMutableArray<NSURLSessionTask *> *_searchTasks;
     NSUInteger _generation;
@@ -172,7 +170,6 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
     NSURLSessionDownloadTask *_activeDownloadTask;
     NSURL *_downloadedFileURL;
     NSString *_downloadedItemIdentifier;
-    NSString *_downloadedDisplayName;
     double _downloadProgress;
 }
 
@@ -183,8 +180,8 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
     if (!(self = [super initWithStyle:UITableViewStyleInsetGrouped])) return nil;
     _trackTitle = [title copy] ?: @"";
     _artistName = [artist copy] ?: @"";
-    _trackURI = [trackURI copy] ?: @"";
-    _duration = duration;
+    (void)trackURI;
+    (void)duration;
     _statusMessage = @"Ready to search for downloadable MP3 files.";
     _results = @[];
     _searchTasks = [NSMutableArray array];
@@ -321,7 +318,6 @@ static NSString *SGRFormatByteCount(unsigned long long bytes) {
     _results = @[];
     _downloadedFileURL = nil;
     _downloadedItemIdentifier = nil;
-    _downloadedDisplayName = nil;
     _loading = YES;
     self.navigationItem.rightBarButtonItem.title = @"Cancel";
 
@@ -612,7 +608,6 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     if ([[NSFileManager defaultManager] copyItemAtURL:location toURL:destinationURL error:&moveError]) {
         _downloadedFileURL = destinationURL;
         _downloadedItemIdentifier = _selectedResult[@"identifier"];
-        _downloadedDisplayName = filename;
         _downloadProgress = 1.0;
         _statusMessage = [NSString stringWithFormat:@"Downloaded %@. Opening the share sheet so you can save it to Files…", filename];
     } else {
