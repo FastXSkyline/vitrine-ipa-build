@@ -3,6 +3,7 @@
 #import "Core/SGCore.h"
 #import "SGRTrackLinks.h"
 #import <math.h>
+#import <Security/Security.h>
 
 static NSString *SGRNormalizedMusicText(NSString *value) {
     NSString *folded = [[(value ?: @"") stringByFoldingWithOptions:NSDiacriticInsensitiveSearch
@@ -180,6 +181,52 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
     return options;
 }
 
+
+static NSString * const kSGROpenverseKeychainService = @"com.fastx.vitrine.openverse";
+static NSString * const kSGROpenverseClientIDAccount = @"client-id";
+static NSString * const kSGROpenverseClientSecretAccount = @"client-secret";
+
+static NSString *SGROpenverseKeychainRead(NSString *account) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: kSGROpenverseKeychainService,
+        (__bridge id)kSecAttrAccount: account,
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+    };
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (status != errSecSuccess || !result) return nil;
+    NSData *data = CFBridgingRelease(result);
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+static BOOL SGROpenverseKeychainWrite(NSString *account, NSString *value) {
+    NSData *data = [(value ?: @"") dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data.length) return NO;
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: kSGROpenverseKeychainService,
+        (__bridge id)kSecAttrAccount: account
+    };
+    NSDictionary *updates = @{(__bridge id)kSecValueData: data};
+    OSStatus status = SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)updates);
+    if (status == errSecItemNotFound) {
+        NSMutableDictionary *attributes = [query mutableCopy];
+        attributes[(__bridge id)kSecValueData] = data;
+        attributes[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+        status = SecItemAdd((__bridge CFDictionaryRef)attributes, NULL);
+    }
+    return status == errSecSuccess;
+}
+
+static NSString *SGRFormURLEncode(NSString *value) {
+    NSMutableCharacterSet *allowed = [[NSCharacterSet alphanumericCharacterSet] mutableCopy];
+    [allowed addCharactersInString:@"-._*"];
+    NSString *encoded = [(value ?: @"") stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: @"";
+    return [encoded stringByReplacingOccurrencesOfString:@"%20" withString:@"+"];
+}
+
 @interface SGRTrackLinksController : UITableViewController
 - (instancetype)initWithTitle:(NSString *)title
                         artist:(NSString *)artist
@@ -204,6 +251,11 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
     NSURL *_sourceURL;
     NSURL *_licenseURL;
     NSString *_downloadedDisplayName;
+    NSString *_openverseClientID;
+    NSString *_openverseClientSecret;
+    NSString *_openverseAccessToken;
+    NSDate *_openverseTokenExpiry;
+    BOOL _credentialPromptVisible;
 }
 
 - (instancetype)initWithTitle:(NSString *)title
@@ -216,6 +268,8 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
     _trackURI = [trackURI copy] ?: @"";
     _duration = duration;
     _statusMessage = @"Ready to find an openly licensed copy.";
+    _openverseClientID = SGROpenverseKeychainRead(kSGROpenverseClientIDAccount);
+    _openverseClientSecret = SGROpenverseKeychainRead(kSGROpenverseClientSecretAccount);
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     configuration.timeoutIntervalForRequest = 45.0;
     configuration.timeoutIntervalForResource = 900.0;
@@ -266,6 +320,137 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+- (void)presentOpenverseCredentialPrompt {
+    if (_credentialPromptVisible || self.isBeingDismissed || self.isBeingPresented) return;
+    _credentialPromptVisible = YES;
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Openverse API setup"
+                         message:@"Openverse returned HTTP 401. Register a free API application, verify your email, then paste its Client ID and Client Secret here. The secret is stored in the iOS Keychain, not in the repository."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Client ID";
+        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        field.autocorrectionType = UITextAutocorrectionTypeNo;
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Client Secret";
+        field.secureTextEntry = YES;
+        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        field.autocorrectionType = UITextAutocorrectionTypeNo;
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Open API docs" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_credentialPromptVisible = NO;
+        NSURL *url = [NSURL URLWithString:@"https://api.openverse.org/v1/"];
+        if (url) [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_credentialPromptVisible = NO;
+        self->_loading = NO;
+        self->_statusMessage = @"Openverse requires API credentials for this request. Tap Retry after setup.";
+        [self.tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Save & Retry" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        self->_credentialPromptVisible = NO;
+        NSString *clientID = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:
+                             NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *clientSecret = [alert.textFields.lastObject.text stringByTrimmingCharactersInSet:
+                                  NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!clientID.length || !clientSecret.length) {
+            self->_loading = NO;
+            self->_statusMessage = @"Both Openverse credential fields are required.";
+            [self.tableView reloadData];
+            return;
+        }
+
+        self->_openverseClientID = clientID;
+        self->_openverseClientSecret = clientSecret;
+        self->_openverseAccessToken = nil;
+        self->_openverseTokenExpiry = nil;
+        BOOL idSaved = SGROpenverseKeychainWrite(kSGROpenverseClientIDAccount, clientID);
+        BOOL secretSaved = SGROpenverseKeychainWrite(kSGROpenverseClientSecretAccount, clientSecret);
+        if (!idSaved || !secretSaved) {
+            UIAlertController *notice = [UIAlertController
+                alertControllerWithTitle:@"Keychain storage unavailable"
+                                 message:@"The credentials will be used for this session only. If setup is required again after restarting the app, enter them again."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [notice addAction:[UIAlertAction actionWithTitle:@"Continue" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:notice animated:YES completion:^{
+                [self resolveCurrentTrack];
+            }];
+            return;
+        }
+        [self resolveCurrentTrack];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)requestOpenverseTokenForGeneration:(NSUInteger)generation
+                                completion:(void (^)(NSString *token, NSTimeInterval expiresIn, NSString *errorMessage))completion {
+    if (!_openverseClientID.length || !_openverseClientSecret.length) {
+        completion(nil, 0, @"Openverse API credentials are missing.");
+        return;
+    }
+
+    NSURL *url = [NSURL URLWithString:@"https://api.openverse.org/v1/auth_tokens/token/"];
+    if (!url) {
+        completion(nil, 0, @"Could not create the Openverse authentication request.");
+        return;
+    }
+
+    NSString *body = [NSString stringWithFormat:@"grant_type=client_credentials&client_id=%@&client_secret=%@",
+                      SGRFormURLEncode(_openverseClientID), SGRFormURLEncode(_openverseClientSecret)];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
+                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                       timeoutInterval:30.0];
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    request.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+
+    __weak typeof(self) weakSelf = self;
+    _task = [_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) self = weakSelf;
+            if (!self || self->_generation != generation) return;
+            if (error) {
+                if (error.code == NSURLErrorCancelled) return;
+                completion(nil, 0, @"Could not reach Openverse's authentication endpoint. Check the connection and retry.");
+                return;
+            }
+
+            NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+            NSError *jsonError = nil;
+            id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
+            NSDictionary *dictionary = [payload isKindOfClass:NSDictionary.class] ? payload : nil;
+            NSString *token = [dictionary[@"access_token"] isKindOfClass:NSString.class] ? dictionary[@"access_token"] : @"";
+            NSTimeInterval expiresIn = [dictionary[@"expires_in"] respondsToSelector:@selector(doubleValue)]
+                ? [dictionary[@"expires_in"] doubleValue] : 36000.0;
+            if (!http || http.statusCode < 200 || http.statusCode >= 300 || jsonError || !token.length) {
+                NSString *detail = [dictionary[@"detail"] isKindOfClass:NSString.class] ? dictionary[@"detail"] :
+                                    ([dictionary[@"error_description"] isKindOfClass:NSString.class] ? dictionary[@"error_description"] : @"");
+                NSString *message = detail.length
+                    ? [NSString stringWithFormat:@"Openverse authentication failed (HTTP %ld): %@. Check the Client ID/Secret and verify the registered email.", (long)(http.statusCode), detail]
+                    : [NSString stringWithFormat:@"Openverse authentication failed (HTTP %ld). Check the Client ID/Secret and verify the registered email.", (long)(http.statusCode)];
+                completion(nil, 0, message);
+                return;
+            }
+            completion(token, MAX(60.0, expiresIn), nil);
+        });
+    }];
+    [_task resume];
+}
+
 - (void)resolveCurrentTrack {
     _generation++;
     NSUInteger generation = _generation;
@@ -285,6 +470,27 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
         _loading = NO;
         _statusMessage = @"The current track is missing its title or artist. Nothing was downloaded.";
         [self.tableView reloadData];
+        return;
+    }
+
+    if (_openverseClientID.length && _openverseClientSecret.length &&
+        (!_openverseAccessToken.length || !_openverseTokenExpiry || _openverseTokenExpiry.timeIntervalSinceNow < 60.0)) {
+        _statusMessage = @"Authenticating with Openverse…";
+        [self.tableView reloadData];
+        __weak typeof(self) weakSelf = self;
+        [self requestOpenverseTokenForGeneration:generation completion:^(NSString *token, NSTimeInterval expiresIn, NSString *errorMessage) {
+            typeof(self) self = weakSelf;
+            if (!self || self->_generation != generation) return;
+            if (!token.length) {
+                self->_loading = NO;
+                self->_statusMessage = errorMessage ?: @"Openverse authentication failed.";
+                [self.tableView reloadData];
+                return;
+            }
+            self->_openverseAccessToken = token;
+            self->_openverseTokenExpiry = [NSDate dateWithTimeIntervalSinceNow:expiresIn - 60.0];
+            [self resolveCurrentTrack];
+        }];
         return;
     }
 
@@ -312,6 +518,9 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
     request.HTTPMethod = @"GET";
     [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
     [request setValue:@"VitrineAuthorizedMusic/1.0" forHTTPHeaderField:@"User-Agent"];
+    if (_openverseAccessToken.length && _openverseTokenExpiry.timeIntervalSinceNow > 0) {
+        [request setValue:[@"Bearer " stringByAppendingString:_openverseAccessToken] forHTTPHeaderField:@"Authorization"];
+    }
 
     __weak typeof(self) weakSelf = self;
     _task = [_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -331,9 +540,26 @@ static NSArray<NSDictionary *> *SGRDownloadOptionsForItem(NSDictionary *item) {
             id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
             NSArray *results = [payload isKindOfClass:NSDictionary.class] && [payload[@"results"] isKindOfClass:NSArray.class]
                 ? payload[@"results"] : nil;
+            if (http.statusCode == 401) {
+                self->_loading = NO;
+                if (self->_openverseClientID.length && self->_openverseClientSecret.length) {
+                    self->_openverseAccessToken = nil;
+                    self->_openverseTokenExpiry = nil;
+                    self->_statusMessage = @"Openverse rejected the access token. Tap Retry to refresh it; if this repeats, verify your API credentials and email.";
+                    [self.tableView reloadData];
+                } else {
+                    self->_statusMessage = @"Openverse returned HTTP 401. API credentials are needed to continue.";
+                    [self.tableView reloadData];
+                    [self presentOpenverseCredentialPrompt];
+                }
+                return;
+            }
             if (!http || http.statusCode < 200 || http.statusCode >= 300 || jsonError || !results) {
                 self->_loading = NO;
-                self->_statusMessage = [NSString stringWithFormat:@"The open-license index returned no usable results (HTTP %ld). Retry later.", (long)(http.statusCode)];
+                NSString *detail = [payload[@"detail"] isKindOfClass:NSString.class] ? payload[@"detail"] : @"";
+                self->_statusMessage = detail.length
+                    ? [NSString stringWithFormat:@"Openverse returned HTTP %ld: %@.", (long)(http.statusCode), detail]
+                    : [NSString stringWithFormat:@"The open-license index returned no usable results (HTTP %ld). Retry later.", (long)(http.statusCode)];
                 [self.tableView reloadData];
                 return;
             }
