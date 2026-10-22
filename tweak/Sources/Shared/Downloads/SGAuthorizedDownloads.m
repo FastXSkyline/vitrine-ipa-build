@@ -10,7 +10,10 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 @interface SGAuthorizedDownloadsController : UITableViewController <UISearchBarDelegate, NSURLSessionDownloadDelegate>
 @property (nonatomic, copy) NSString *trackTitle;
 @property (nonatomic, copy) NSString *artistName;
-- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist;
+@property (nonatomic) NSTimeInterval trackDuration;
+- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration;
+- (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items;
+- (BOOL)isConfidentMatch:(NSDictionary *)item;
 @end
 
 @implementation SGAuthorizedDownloadsController {
@@ -29,14 +32,16 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     NSString *_downloadFailureReason;
     BOOL _attemptedInitialSearch;
     BOOL _closing;
+    BOOL _manualSearch;
     BOOL _searching;
     NSString *_searchMessage;
 }
 
-- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist {
+- (instancetype)initWithTitle:(NSString *)title artist:(NSString *)artist duration:(NSTimeInterval)duration {
     if (!(self = [super initWithStyle:UITableViewStyleInsetGrouped])) return nil;
     self.trackTitle = [title copy] ?: @"";
     self.artistName = [artist copy] ?: @"";
+    self.trackDuration = MAX(0, duration);
     _results = [NSMutableArray array];
     _library = [[NSUserDefaults.standardUserDefaults arrayForKey:kSGAuthorizedLibraryKey] mutableCopy] ?: [NSMutableArray array];
     _queue = [NSMutableArray array];
@@ -53,7 +58,7 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 72;
 
-    _segments = [[UISegmentedControl alloc] initWithItems:@[@"Search", @"Library"]];
+    _segments = [[UISegmentedControl alloc] initWithItems:@[@"Current track", @"Library"]];
     _segments.selectedSegmentIndex = 0;
     [_segments addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
 
@@ -62,22 +67,28 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     _searchBar.placeholder = @"Search licensed music";
     NSString *query = [@[self.trackTitle ?: @"", self.artistName ?: @""] componentsJoinedByString:@" "];
     _searchBar.text = [query stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    _searchBar.hidden = YES;
 
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, CGRectGetWidth(self.tableView.bounds), 106)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, CGRectGetWidth(self.tableView.bounds), 50)];
     [header addSubview:_segments];
     [header addSubview:_searchBar];
     self.tableView.tableHeaderView = header;
     [self layoutHeader];
 
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"API ID"
-                                                                              style:UIBarButtonItemStylePlain
-                                                                             target:self
-                                                                             action:@selector(editClientID)];
+    UIBarButtonItem *searchButton = [[UIBarButtonItem alloc] initWithTitle:@"Search"
+                                                                     style:UIBarButtonItemStylePlain
+                                                                    target:self
+                                                                    action:@selector(enableManualSearch)];
+    UIBarButtonItem *apiButton = [[UIBarButtonItem alloc] initWithTitle:@"API ID"
+                                                                  style:UIBarButtonItemStylePlain
+                                                                 target:self
+                                                                 action:@selector(editClientID)];
+    self.navigationItem.rightBarButtonItems = @[searchButton, apiButton];
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
                                                                                            target:self
                                                                                            action:@selector(close)];
     UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 66)];
-    footer.text = @"Only tracks marked as downloadable by their provider are offered. Saved files live in Vitrine's private library, separate from Spotify Downloads; licenses differ by track.";
+    footer.text = @"Vitrine matches the current track by title, artist and duration. Only files explicitly marked downloadable by their provider are saved; this library is separate from Spotify Downloads.";
     footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     footer.textColor = UIColor.secondaryLabelColor;
     footer.numberOfLines = 0;
@@ -102,8 +113,11 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 - (void)layoutHeader {
     if (!_segments || !_searchBar) return;
     CGFloat width = CGRectGetWidth(self.tableView.bounds);
+    BOOL showSearch = _manualSearch && _segments.selectedSegmentIndex == 0;
+    _searchBar.hidden = !showSearch;
     UIView *header = self.tableView.tableHeaderView;
-    CGRect newFrame = CGRectMake(0, 0, width, 106);
+    CGFloat height = showSearch ? 106 : 50;
+    CGRect newFrame = CGRectMake(0, 0, width, height);
     BOOL changed = !CGRectEqualToRect(header.frame, newFrame);
     if (changed) header.frame = newFrame;
     _segments.frame = CGRectMake(16, 8, MAX(0, width - 32), 32);
@@ -134,12 +148,17 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
 }
 
 - (void)segmentChanged:(UISegmentedControl *)sender {
-    BOOL searching = sender.selectedSegmentIndex == 0;
-    _searchBar.hidden = NO;
-    _searchBar.userInteractionEnabled = searching;
-    _searchBar.alpha = searching ? 1.0 : 0.45;
-    if (!searching) [_searchBar resignFirstResponder];
+    if (sender.selectedSegmentIndex == 1) [_searchBar resignFirstResponder];
+    [self layoutHeader];
     [self.tableView reloadData];
+}
+
+- (void)enableManualSearch {
+    _manualSearch = YES;
+    if (_searchBar.text.length == 0) _searchBar.text = self.trackTitle ?: @"";
+    [self layoutHeader];
+    [self.tableView reloadData];
+    [_searchBar becomeFirstResponder];
 }
 
 - (void)editClientID {
