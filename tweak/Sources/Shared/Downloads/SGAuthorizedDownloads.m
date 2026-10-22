@@ -7,6 +7,49 @@
 static NSString *const kSGJamendoClientIDKey = @"spotifyglass.authorizedDownloads.jamendoClientID";
 static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownloads.library";
 
+static NSString *SGDownloadNormalize(NSString *value) {
+    if (![value isKindOfClass:NSString.class]) return @"";
+    NSString *folded = [[value lowercaseString] stringByFoldingWithOptions:NSDiacriticInsensitiveSearch
+                                                                      locale:[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]];
+    NSCharacterSet *lettersAndDigits = NSCharacterSet.alphanumericCharacterSet;
+    NSMutableString *normalized = [NSMutableString string];
+    BOOL needsSpace = NO;
+    for (NSUInteger i = 0; i < folded.length; i++) {
+        unichar character = [folded characterAtIndex:i];
+        if ([lettersAndDigits characterIsMember:character]) {
+            if (needsSpace && normalized.length) [normalized appendString:@" "];
+            [normalized appendFormat:@"%C", character];
+            needsSpace = NO;
+        } else {
+            needsSpace = YES;
+        }
+    }
+    return [normalized stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+static NSSet<NSString *> *SGDownloadTokens(NSString *value) {
+    NSString *normalized = SGDownloadNormalize(value);
+    if (!normalized.length) return [NSSet set];
+    NSMutableSet<NSString *> *tokens = [NSMutableSet setWithArray:[normalized componentsSeparatedByString:@" "]];
+    [tokens removeObject:@"feat"];
+    [tokens removeObject:@"featuring"];
+    [tokens removeObject:@"with"];
+    return tokens;
+}
+
+// Conservative token overlap: a partial phrase is not treated as an exact song/artist match.
+static double SGDownloadSimilarity(NSString *left, NSString *right) {
+    NSString *a = SGDownloadNormalize(left), *b = SGDownloadNormalize(right);
+    if (!a.length || !b.length) return 0;
+    if ([a isEqualToString:b]) return 1.0;
+    NSSet<NSString *> *leftTokens = SGDownloadTokens(a);
+    NSSet<NSString *> *rightTokens = SGDownloadTokens(b);
+    if (!leftTokens.count || !rightTokens.count) return 0;
+    NSMutableSet<NSString *> *common = [leftTokens mutableCopy];
+    [common intersectSet:rightTokens];
+    return (double)common.count / (double)MAX(leftTokens.count, rightTokens.count);
+}
+
 @interface SGAuthorizedDownloadsController : UITableViewController <UISearchBarDelegate, NSURLSessionDownloadDelegate>
 @property (nonatomic, copy) NSString *trackTitle;
 @property (nonatomic, copy) NSString *artistName;
@@ -198,6 +241,51 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
     [self performSearch];
 }
 
+- (NSDictionary *)bestMatchFrom:(NSArray<NSDictionary *> *)items {
+    NSDictionary *best = nil;
+    double bestScore = -1;
+    for (NSDictionary *item in items) {
+        NSString *candidateTitle = [item[@"name"] isKindOfClass:NSString.class] ? item[@"name"] : @"";
+        NSString *candidateArtist = [item[@"artist_name"] isKindOfClass:NSString.class] ? item[@"artist_name"] : @"";
+        double titleScore = SGDownloadSimilarity(self.trackTitle, candidateTitle);
+        double artistScore = SGDownloadSimilarity(self.artistName, candidateArtist);
+        if (titleScore <= 0 || artistScore <= 0) continue;
+
+        double durationScore = 0;
+        double durationDelta = DBL_MAX;
+        double candidateDuration = [item[@"duration"] respondsToSelector:@selector(doubleValue)] ? [item[@"duration"] doubleValue] : 0;
+        BOOL hasDuration = self.trackDuration > 0 && candidateDuration > 0;
+        if (hasDuration) {
+            durationDelta = fabs(self.trackDuration - candidateDuration);
+            durationScore = durationDelta <= 3 ? 1.0 : durationDelta <= 7 ? 0.8 : durationDelta <= 14 ? 0.5 : durationDelta <= 20 ? 0.2 : 0.0;
+        }
+        double score = hasDuration
+            ? (0.60 * titleScore + 0.33 * artistScore + 0.07 * durationScore)
+            : (0.64 * titleScore + 0.36 * artistScore);
+        NSMutableDictionary *scored = [item mutableCopy];
+        scored[@"_vitrineScore"] = @(score);
+        scored[@"_vitrineTitleScore"] = @(titleScore);
+        scored[@"_vitrineArtistScore"] = @(artistScore);
+        if (hasDuration) scored[@"_vitrineDurationDelta"] = @(durationDelta);
+        if (score > bestScore) {
+            best = scored;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+- (BOOL)isConfidentMatch:(NSDictionary *)item {
+    if (![item isKindOfClass:NSDictionary.class]) return NO;
+    double score = [item[@"_vitrineScore"] doubleValue];
+    double titleScore = [item[@"_vitrineTitleScore"] doubleValue];
+    double artistScore = [item[@"_vitrineArtistScore"] doubleValue];
+    NSNumber *durationDelta = item[@"_vitrineDurationDelta"];
+    // Any duration mismatch greater than 20 seconds is treated as another edit/version, not the same track.
+    if (durationDelta && durationDelta.doubleValue > 20.0) return NO;
+    return score >= 0.85 && titleScore >= 0.80 && artistScore >= 0.70;
+}
+
 - (void)performSearch {
     if (_segments.selectedSegmentIndex != 0) _segments.selectedSegmentIndex = 0;
     NSString *clientID = [NSUserDefaults.standardUserDefaults stringForKey:kSGJamendoClientIDKey];
@@ -205,29 +293,48 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
         [self promptForClientIDAndSearch:YES];
         return;
     }
-    NSString *query = [_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+
+    // Automatic mode looks up the playing title only, then independently scores artist + duration.
+    // Manual mode is an explicit fallback and uses what the user typed.
+    NSString *query = _manualSearch
+        ? [_searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+        : [self.trackTitle stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!query.length && !_manualSearch) {
+        query = [self.artistName stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
     if (!query.length) {
-        _searchMessage = @"Enter a song title or artist to search.";
+        _searchMessage = @"No current track title is available.";
         [_results removeAllObjects];
         [self.tableView reloadData];
         return;
     }
 
     NSURLComponents *components = [NSURLComponents componentsWithString:@"https://api.jamendo.com/v3.0/tracks/"];
-    components.queryItems = @[
+    NSMutableArray<NSURLQueryItem *> *queryItems = [@[
         [NSURLQueryItem queryItemWithName:@"client_id" value:clientID],
         [NSURLQueryItem queryItemWithName:@"format" value:@"json"],
-        [NSURLQueryItem queryItemWithName:@"limit" value:@"30"],
-        [NSURLQueryItem queryItemWithName:@"search" value:query],
+        [NSURLQueryItem queryItemWithName:@"limit" value:@"50"],
+        [NSURLQueryItem queryItemWithName:@"namesearch" value:query],
         [NSURLQueryItem queryItemWithName:@"include" value:@"licenses"],
         [NSURLQueryItem queryItemWithName:@"order" value:@"relevance"]
-    ];
+    ] mutableCopy];
+    if (!_manualSearch && self.artistName.length) {
+        // Ask the catalogue for the artist as well, but still rank the returned candidates locally.
+        [queryItems addObject:[NSURLQueryItem queryItemWithName:@"artist_name" value:self.artistName]];
+    }
+    if (!_manualSearch && self.trackDuration > 20) {
+        NSInteger low = MAX(1, (NSInteger)floor(self.trackDuration - 20));
+        NSInteger high = (NSInteger)ceil(self.trackDuration + 20);
+        [queryItems addObject:[NSURLQueryItem queryItemWithName:@"durationbetween"
+                                                          value:[NSString stringWithFormat:@"%ld_%ld", (long)low, (long)high]]];
+    }
+    components.queryItems = queryItems;
     NSURL *url = components.URL;
     if (!url) return;
 
     [_searchTask cancel];
     _searching = YES;
-    _searchMessage = @"Searching Jamendo…";
+    _searchMessage = _manualSearch ? @"Searching licensed tracks…" : @"Matching the current track…";
     [_results removeAllObjects];
     [self.tableView reloadData];
 
@@ -239,31 +346,60 @@ static NSString *const kSGAuthorizedLibraryKey = @"spotifyglass.authorizedDownlo
             self->_searching = NO;
             if (error) {
                 if (error.code == NSURLErrorCancelled) return;
-                self->_searchMessage = @"Search failed. Check your connection and API ID, then try again.";
+                self->_searchMessage = @"Lookup failed. Check the connection and Jamendo API ID, then try again.";
+                [self.tableView reloadData];
+                return;
+            }
+            NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+            if (http && (http.statusCode < 200 || http.statusCode >= 300)) {
+                self->_searchMessage = [NSString stringWithFormat:@"The music catalogue returned HTTP %ld.", (long)http.statusCode];
                 [self.tableView reloadData];
                 return;
             }
             NSError *jsonError = nil;
             id payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError] : nil;
-            if (![payload isKindOfClass:NSDictionary.class] || jsonError) {
-                self->_searchMessage = @"Jamendo returned an unreadable response.";
+            if (![payload isKindOfClass:NSDictionary.class] || jsonError || [payload[@"headers"] isKindOfClass:NSDictionary.class] && [payload[@"results"] isKindOfClass:NSArray.class] == NO) {
+                self->_searchMessage = @"The music catalogue returned an unreadable response.";
+                [self.tableView reloadData];
+                return;
+            }
+            if ([payload[@"headers"] isKindOfClass:NSDictionary.class] && [payload[@"headers"][@"status"] isKindOfClass:NSString.class]
+                && [payload[@"headers"][@"status"] caseInsensitiveCompare:@"success"] != NSOrderedSame) {
+                self->_searchMessage = @"The music catalogue rejected this request. Check the API ID.";
                 [self.tableView reloadData];
                 return;
             }
             NSArray *items = [payload[@"results"] isKindOfClass:NSArray.class] ? payload[@"results"] : @[];
-            NSMutableArray *permitted = [NSMutableArray array];
+            NSMutableArray<NSDictionary *> *permitted = [NSMutableArray array];
             for (id candidate in items) {
                 if (![candidate isKindOfClass:NSDictionary.class]) continue;
                 NSDictionary *item = candidate;
                 NSString *downloadURL = [item[@"audiodownload"] isKindOfClass:NSString.class] ? item[@"audiodownload"] : @"";
                 id canDownload = item[@"audiodownload_allowed"];
-                // Fail closed: a track is shown only when the API explicitly says its artist allows downloads.
+                // Fail closed: the provider must explicitly allow this file to be downloaded.
                 if (![canDownload respondsToSelector:@selector(boolValue)] || ![canDownload boolValue] || !downloadURL.length) continue;
                 if (![item[@"id"] isKindOfClass:NSString.class] || ![item[@"name"] isKindOfClass:NSString.class]) continue;
                 [permitted addObject:item];
             }
-            self->_results = permitted;
-            self->_searchMessage = permitted.count ? nil : @"No downloadable match found in this licensed catalog. It may not contain the song currently playing.";
+
+            if (self->_manualSearch) {
+                // Manual fallback remains short; never display the entire catalogue response.
+                if (permitted.count > 8) permitted = [[permitted subarrayWithRange:NSMakeRange(0, 8)] mutableCopy];
+                self->_results = permitted;
+                self->_searchMessage = permitted.count ? nil : @"No downloadable tracks matched that title.";
+            } else {
+                NSDictionary *best = [self bestMatchFrom:permitted];
+                if ([self isConfidentMatch:best]) {
+                    self->_results = [NSMutableArray arrayWithObject:best];
+                    self->_searchMessage = nil;
+                    // Choosing Download current track is the user's action; a high-confidence authorized
+                    // match is queued automatically with no second search or download button.
+                    [self enqueueTrack:best atFront:YES];
+                } else {
+                    self->_results = [NSMutableArray array];
+                    self->_searchMessage = @"No confident downloadable match was found for this exact title and artist. Use Search to check the licensed catalogue manually.";
+                }
+            }
             [self.tableView reloadData];
         });
     }];
