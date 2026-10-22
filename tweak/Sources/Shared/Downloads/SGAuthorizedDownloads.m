@@ -501,7 +501,7 @@ static double SGDownloadSimilarity(NSString *left, NSString *right) {
 
     if (_searching || !_results.count) {
         cell.textLabel.text = _searchMessage ?: @"Search for a song or artist";
-        cell.detailTextLabel.text = _searching ? @"Please wait…" : @"Results are limited to tracks that the provider says can be downloaded.";
+        cell.detailTextLabel.text = _searching ? @"Please wait…" : @"Matching tracks appear here; a lock means the uploader has not enabled downloads.";
         cell.textLabel.textColor = UIColor.secondaryLabelColor;
         return cell;
     }
